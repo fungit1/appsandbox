@@ -283,7 +283,11 @@ static HGLOBAL clip_build_hdrop_from_temp(void)
     df->fWide = TRUE;
     ptr = (wchar_t *)((BYTE *)df + sizeof(DROPFILES));
     for (i = 0; i < count; i++) {
-        wcscpy_s(ptr, MAX_PATH, paths[i]);
+        /* destsz must be this entry's reserved slice (wcslen+1), NOT MAX_PATH:
+           the buffer is sized tightly per path (see total_size above), so passing
+           MAX_PATH makes wcscpy_s's secure-CRT tail-fill memset run past the
+           allocation -> heap overflow (caught by full page heap at memset). */
+        wcscpy_s(ptr, wcslen(paths[i]) + 1, paths[i]);
         ptr += wcslen(paths[i]) + 1;
     }
     *ptr = L'\0';
