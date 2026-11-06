@@ -104,6 +104,23 @@ struct VmClipboardData {
     HANDLE           writer_thread;
     CRITICAL_SECTION writer_cs;
 
+    /* Push worker: every host->guest clipboard send happens on this thread so
+       the UI thread never blocks on the socket. The writer socket can be busy
+       for the whole of a file transfer (the guest expects one uninterrupted
+       byte stream), so a send from the UI thread would freeze the window for
+       the length of the transfer. */
+    HANDLE           push_thread;
+    HANDLE           push_event;      /* signalled when work is queued */
+    volatile LONG    pending_sync;    /* -1 = nothing, 0 = disable, 1 = enable */
+    volatile LONG    pending_push;    /* 1 = a FORMAT_LIST push is queued */
+
+    /* GetClipboardSequenceNumber() of the clipboard content last pushed to the
+       guest. An unchanged value means the guest already holds this content, so
+       pushing it again would only make the guest delete its staged file and
+       download it all over again. */
+    volatile LONG    pushed_seq;
+    volatile LONG    pushed_seq_valid;
+
     /* Reader channel (:0006 guest->host) */
     volatile SOCKET  reader_socket;
     volatile LONG    reader_suppress;
@@ -201,6 +218,11 @@ static SOCKET clip_connect_hv(const GUID *vm_runtime_id, const GUID *service_gui
     ioctlsocket(s, FIONBIO, &nonblock);
     sock_timeout = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
+    /* Bound blocking sends so a stalled guest cannot pin a sender (and the
+       writer_cs it holds) forever. The push worker is off the UI thread, but a
+       bounded send also lets shutdown finish if the guest has gone away. */
+    sock_timeout = 10000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&sock_timeout, sizeof(sock_timeout));
     return s;
 }
 
@@ -428,6 +450,30 @@ static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
     return hMem;
 }
 
+/* ---- Push queue ----
+ *
+ * The UI thread never talks to the clipboard socket directly: it queues the
+ * request here and the push worker performs the send. Queuing is non-blocking,
+ * so focus changes and WM_CLIPBOARDUPDATE cannot freeze the window while a
+ * large CF_HDROP transfer is streaming.
+ */
+
+static void clip_queue_sync_enable(VmClipboard clip, BOOL enabled)
+{
+    /* Disabling sync makes a queued format-list push stale. Drop it so the
+       worker cannot push host clipboard contents after the focus gate closes. */
+    if (!enabled)
+        InterlockedExchange(&clip->pending_push, 0);
+    InterlockedExchange(&clip->pending_sync, enabled ? 1 : 0);
+    if (clip->push_event) SetEvent(clip->push_event);
+}
+
+static void clip_queue_push(VmClipboard clip)
+{
+    InterlockedExchange(&clip->pending_push, 1);
+    if (clip->push_event) SetEvent(clip->push_event);
+}
+
 /* ---- Writer channel: send SYNC_ENABLE ---- */
 
 static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
@@ -461,11 +507,38 @@ static void clip_send_format_list(VmClipboard clip)
     BYTE buf[16384];
     int offset = 4;
     UINT32 count = 0;
+    DWORD seq;
 
     s = clip->writer_socket;
     if (s == INVALID_SOCKET) return;
 
-    if (!OpenClipboard(clip->hwnd)) return;
+    /* GetClipboardSequenceNumber() changes whenever the clipboard content
+       changes. When it has not changed since the last successful push, the
+       guest already holds this content - including any file it staged in its
+       temp folder - so pushing again would make the guest delete the staged
+       file and download it all over again. That is what happened on every
+       alt-tab back into the VM. */
+    seq = GetClipboardSequenceNumber();
+    if (seq != 0 &&
+        InterlockedCompareExchange(&clip->pushed_seq_valid, 0, 0) &&
+        (LONG)seq == InterlockedCompareExchange(&clip->pushed_seq, 0, 0)) {
+        clip_log(clip, L"CLIP: Clipboard unchanged (seq %u) - not re-pushing to guest.",
+                 (unsigned)seq);
+        return;
+    }
+
+    /* Another clipboard owner can hold the clipboard open for a moment (the
+       UI thread applies guest content on the same clipboard). Retry briefly
+       rather than dropping the push. This runs on the push worker, so the
+       short sleeps do not block the window. */
+    {
+        int attempt;
+        for (attempt = 0; attempt < 10; attempt++) {
+            if (OpenClipboard(clip->hwnd)) break;
+            Sleep(20);
+        }
+        if (attempt == 10) return;
+    }
 
     {
         BOOL has_hdrop = IsClipboardFormatAvailable(CF_HDROP);
@@ -491,6 +564,17 @@ static void clip_send_format_list(VmClipboard clip)
             count++;
         }
     }
+
+    /* Re-read the sequence number while we still own the clipboard: it now
+       describes exactly the content we enumerated. Reading it before opening
+       the clipboard left a window in which another application could replace
+       the content, making us record a sequence number that does not match
+       what we sent. */
+    {
+        DWORD cur = GetClipboardSequenceNumber();
+        if (cur != 0) seq = cur;
+    }
+
     CloseClipboard();
 
     if (count == 0) return;
@@ -505,11 +589,59 @@ static void clip_send_format_list(VmClipboard clip)
     InterlockedExchange(&clip->reader_suppress, 1);
 
     EnterCriticalSection(&clip->writer_cs);
-    clip_send_all(s, &hdr, sizeof(hdr));
-    clip_send_all(s, buf, offset);
-    LeaveCriticalSection(&clip->writer_cs);
+    {
+        BOOL sent = clip_send_all(s, &hdr, sizeof(hdr)) &&
+                    clip_send_all(s, buf, offset);
+        if (sent) {
+            /* Remember what actually made it onto the wire, so the next focus
+               change does not push it again. */
+            InterlockedExchange(&clip->pushed_seq, (LONG)seq);
+            InterlockedExchange(&clip->pushed_seq_valid, seq != 0);
+        } else {
+            /* No echo will arrive if the send failed; do not suppress the next
+               guest format list. */
+            InterlockedExchange(&clip->reader_suppress, 0);
+        }
+        LeaveCriticalSection(&clip->writer_cs);
+        if (sent)
+            clip_log(clip, L"CLIP: Sent format list (%u formats) to guest.", count);
+        else
+            clip_log(clip, L"CLIP: Failed to send format list to guest.");
+    }
+}
 
-    clip_log(clip, L"CLIP: Sent format list (%u formats) to guest.", count);
+/* ---- Push worker thread ---- */
+
+static DWORD WINAPI clip_push_thread_proc(LPVOID param)
+{
+    VmClipboard clip = (VmClipboard)param;
+
+    for (;;) {
+        LONG sync;
+        LONG push;
+
+        if (clip->push_event)
+            WaitForSingleObject(clip->push_event, 250);
+        else
+            Sleep(250);
+        if (clip->stop) break;
+
+        /* Drain the queue. SYNC_ENABLE is always sent before the format list
+           that depends on it, so the guest never sees a format list while its
+           sync is still disabled. */
+        for (;;) {
+            sync = InterlockedExchange(&clip->pending_sync, -1);
+            push = InterlockedExchange(&clip->pending_push, 0);
+            if (sync < 0 && !push) break;
+
+            if (sync >= 0) clip_send_sync_enable(clip, sync != 0);
+            if (push && clip->sync_enabled) clip_send_format_list(clip);
+            if (clip->stop) break;
+        }
+    }
+
+    clip->push_thread = NULL;
+    return 0;
 }
 
 /* ---- Writer channel: handle DATA_REQ from guest ---- */
@@ -536,35 +668,45 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
     }
 
     if (fmt == CF_HDROP) {
+        wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
+        int path_count = 0;
+
+        /* Snapshot the dropped paths while the clipboard is open, then release
+           it again. Holding OpenClipboard() across a multi-gigabyte transfer
+           would lock every other application on the host out of the clipboard
+           for the whole transfer. */
         if (OpenClipboard(NULL)) {
             HANDLE hData = GetClipboardData(CF_HDROP);
             if (hData) {
                 HDROP hDrop = (HDROP)hData;
                 UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
                 UINT fi;
-                EnterCriticalSection(&clip->writer_cs);
-                for (fi = 0; fi < file_count; fi++) {
-                    wchar_t path[MAX_PATH];
-                    wchar_t *name;
-                    DragQueryFileW(hDrop, fi, path, MAX_PATH);
-                    name = wcsrchr(path, L'\\');
-                    name = name ? name + 1 : path;
-                    clip_send_file_entry(s, path, name);
-                }
-                hdr.magic = CLIP_MAGIC;
-                hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-                hdr.format = CF_HDROP;
-                hdr.data_size = 0;
-                clip_send_all(s, &hdr, sizeof(hdr));
-                LeaveCriticalSection(&clip->writer_cs);
-            } else {
-                CloseClipboard();
-                goto send_empty;
+                if (file_count > CLIP_MAX_FORMATS) file_count = CLIP_MAX_FORMATS;
+                for (fi = 0; fi < file_count; fi++)
+                    DragQueryFileW(hDrop, fi, paths[path_count++], MAX_PATH);
             }
             CloseClipboard();
-        } else {
-            goto send_empty;
         }
+
+        if (path_count == 0) goto send_empty;
+
+        EnterCriticalSection(&clip->writer_cs);
+        {
+            int i;
+            for (i = 0; i < path_count; i++) {
+                const wchar_t *path = paths[i];
+                const wchar_t *name;
+                name = wcsrchr(path, L'\\');
+                name = name ? name + 1 : path;
+                clip_send_file_entry(s, path, name);
+            }
+        }
+        hdr.magic = CLIP_MAGIC;
+        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
+        hdr.format = CF_HDROP;
+        hdr.data_size = 0;
+        clip_send_all(s, &hdr, sizeof(hdr));
+        LeaveCriticalSection(&clip->writer_cs);
         return;
 
     send_empty:
@@ -671,11 +813,15 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
                     setsockopt(ws, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
                     clip->writer_socket = ws;
                     clip_log(clip, L"CLIP: Writer reconnected (GUID :0005).");
+                    /* The guest side restarted, so it lost its clipboard and
+                       the file it had staged. Force a fresh push even if the
+                       host clipboard has not changed since the last one. */
+                    InterlockedExchange(&clip->pushed_seq_valid, 0);
                     if (clip->sync_enabled) {
-                        clip_send_sync_enable(clip, TRUE);
-                        clip_send_format_list(clip);
+                        clip_queue_sync_enable(clip, TRUE);
+                        clip_queue_push(clip);
                     } else {
-                        clip_send_sync_enable(clip, FALSE);
+                        clip_queue_sync_enable(clip, FALSE);
                     }
                     break;
                 }
@@ -980,6 +1126,17 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
 
 /* ---- Public API ---- */
 
+static BOOL clip_join_thread(HANDLE *thread, DWORD timeout_ms)
+{
+    DWORD result;
+
+    if (!*thread) return TRUE;
+    result = WaitForSingleObject(*thread, timeout_ms);
+    CloseHandle(*thread);
+    *thread = NULL;
+    return result == WAIT_OBJECT_0;
+}
+
 ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
                                         const wchar_t *os_type,
                                         HWND hwnd,
@@ -1004,9 +1161,15 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->reader_socket = INVALID_SOCKET;
     clip->writer_suppress = 0;
     clip->reader_suppress = 0;
+    clip->pending_sync = -1;
+    clip->pending_push = 0;
+    clip->pushed_seq = 0;
+    clip->pushed_seq_valid = 0;
 
     InitializeCriticalSection(&clip->writer_cs);
     InitializeCriticalSection(&clip->reader_cs);
+
+    clip->push_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     GetTempPathW(MAX_PATH, tmp);
     swprintf_s(clip->temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
@@ -1022,20 +1185,25 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
             DWORD no_timeout = 0;
             setsockopt(writer_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
             clip->writer_socket = writer_s;
-            clip_send_sync_enable(clip, FALSE);
         } else {
             closesocket(writer_s);
         }
     }
 
+    clip->push_thread   = CreateThread(NULL, 0, clip_push_thread_proc, clip, 0, NULL);
     clip->writer_thread = CreateThread(NULL, 0, clip_writer_thread_proc, clip, 0, NULL);
     clip->reader_thread = CreateThread(NULL, 0, clip_reader_thread_proc, clip, 0, NULL);
+
+    /* Sync starts out disabled - tell the guest. */
+    clip_queue_sync_enable(clip, FALSE);
 
     return clip;
 }
 
 ASB_API void vm_clipboard_destroy(VmClipboard clip)
 {
+    BOOL stopped = TRUE;
+
     if (!clip) return;
 
     clip->stop = TRUE;
@@ -1053,17 +1221,27 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
         if (old != INVALID_SOCKET) closesocket(old);
     }
 
-    if (clip->writer_thread) {
-        WaitForSingleObject(clip->writer_thread, 3000);
-        CloseHandle(clip->writer_thread);
-    }
-    if (clip->reader_thread) {
-        WaitForSingleObject(clip->reader_thread, 3000);
-        CloseHandle(clip->reader_thread);
+    /* Wake the push worker even if it is waiting on the event, and give the
+       send paths time to notice the closed socket (SO_SNDTIMEO is 10 s). */
+    if (clip->push_event) SetEvent(clip->push_event);
+
+    stopped &= clip_join_thread(&clip->writer_thread, 15000);
+    stopped &= clip_join_thread(&clip->reader_thread, 15000);
+    stopped &= clip_join_thread(&clip->push_thread, 15000);
+
+    if (!stopped) {
+        /* A thread is still using this object (for example blocked in a file
+           read). Leaking it at shutdown is safer than freeing it underneath. */
+        return;
     }
 
     clip_reader_free_pending(clip);
     clip_remove_dir_recursive(clip->temp_dir);
+
+    if (clip->push_event) {
+        CloseHandle(clip->push_event);
+        clip->push_event = NULL;
+    }
 
     DeleteCriticalSection(&clip->writer_cs);
     DeleteCriticalSection(&clip->reader_cs);
@@ -1080,10 +1258,15 @@ ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled)
     clip_log(clip, L"CLIP: Window %s — clipboard sync %s.",
              enabled ? L"focused" : L"unfocused",
              enabled ? L"ON" : L"OFF");
-    clip_send_sync_enable(clip, enabled);
+
+    /* Queue rather than send: the window thread must not block on the
+       clipboard socket, which can be held for the whole of a file transfer.
+       SYNC_ENABLE is queued before the format list so the guest sees them in
+       that order. */
+    clip_queue_sync_enable(clip, enabled);
 
     if (enabled) {
-        clip_send_format_list(clip);
+        clip_queue_push(clip);
     }
 }
 
@@ -1100,7 +1283,7 @@ ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
     /* Focus gate */
     if (!clip->sync_enabled) return;
 
-    clip_send_format_list(clip);
+    clip_queue_push(clip);
 }
 
 ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
@@ -1142,6 +1325,19 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
                     GlobalFree(hMem);
                 }
             }
+        }
+    }
+
+    /* The host clipboard now holds the guest's own content, and the guest
+       already has it. Remember the new sequence number as "already pushed" so
+       the next focus change does not push it straight back - that would make
+       the guest delete and re-download its own file. Read it while the
+       clipboard is still ours, before another application can change it. */
+    {
+        DWORD seq = GetClipboardSequenceNumber();
+        if (seq != 0) {
+            InterlockedExchange(&clip->pushed_seq, (LONG)seq);
+            InterlockedExchange(&clip->pushed_seq_valid, 1);
         }
     }
 
