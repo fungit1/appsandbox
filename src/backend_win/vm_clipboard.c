@@ -55,6 +55,8 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 #define CLIP_MSG_FORMAT_DATA_REQ  2
 #define CLIP_MSG_FORMAT_DATA_RESP 3
 #define CLIP_MSG_FILE_DATA        4
+#define CLIP_MSG_FILE_LIST        5   /* host -> guest: file metadata for FileContents */
+#define CLIP_MSG_FILE_DATA_REQ    6   /* guest -> host: request one file's bytes */
 /* CLIP_MSG_SYNC_ENABLE = 12 (defined in header) */
 
 #define CLIP_MAX_FORMATS    64
@@ -120,6 +122,15 @@ struct VmClipboardData {
        download it all over again. */
     volatile LONG    pushed_seq;
     volatile LONG    pushed_seq_valid;
+
+    /* Paths captured while the last FORMAT_LIST was pushed. A guest that renders
+       files lazily only asks for the bytes when the user pastes - possibly long
+       after the list was sent. Streaming from this snapshot guarantees it gets
+       the files it was told about, even if the host clipboard has changed since
+       (and avoids re-reading somebody else's clipboard at paste time). */
+    wchar_t          pushed_paths[CLIP_MAX_FORMATS][MAX_PATH];
+    int              pushed_path_count;
+    CRITICAL_SECTION pushed_paths_cs;
 
     /* Reader channel (:0006 guest->host) */
     volatile SOCKET  reader_socket;
@@ -490,6 +501,30 @@ static void clip_send_sync_enable(VmClipboard clip, BOOL enabled)
 
 /* ---- Writer channel: send FORMAT_LIST ---- */
 
+/* Capture the files that the FORMAT_LIST we are about to send advertises.
+   Called while this thread holds the clipboard open. */
+static void clip_snapshot_pushed_paths(VmClipboard clip)
+{
+    wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
+    int path_count = 0;
+    HANDLE hData;
+
+    hData = GetClipboardData(CF_HDROP);
+    if (hData) {
+        UINT file_count = DragQueryFileW((HDROP)hData, 0xFFFFFFFF, NULL, 0);
+        UINT fi;
+        if (file_count > CLIP_MAX_FORMATS) file_count = CLIP_MAX_FORMATS;
+        for (fi = 0; fi < file_count; fi++)
+            DragQueryFileW((HDROP)hData, fi, paths[path_count++], MAX_PATH);
+    }
+
+    EnterCriticalSection(&clip->pushed_paths_cs);
+    if (path_count > 0)
+        memcpy(clip->pushed_paths, paths, sizeof(paths[0]) * (size_t)path_count);
+    clip->pushed_path_count = path_count;
+    LeaveCriticalSection(&clip->pushed_paths_cs);
+}
+
 static void clip_send_format_list(VmClipboard clip)
 {
     ClipHeader hdr;
@@ -567,6 +602,9 @@ static void clip_send_format_list(VmClipboard clip)
         if (cur != 0) seq = cur;
     }
 
+    /* Remember the advertised files while we still hold the clipboard. */
+    clip_snapshot_pushed_paths(clip);
+
     CloseClipboard();
 
     if (count == 0) return;
@@ -590,6 +628,126 @@ static void clip_send_format_list(VmClipboard clip)
     InterlockedExchange(&clip->pushed_seq_valid, seq != 0);
 
     clip_log(clip, L"CLIP: Sent format list (%u formats) to guest.", count);
+
+    /* Send file metadata (names + sizes) so a new guest can advertise the files
+       as CFSTR_FILEDESCRIPTORW/CFSTR_FILECONTENTS and stream them on demand.
+       Old guests ignore this message type. */
+    {
+        wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
+        int path_count = 0;
+        EnterCriticalSection(&clip->pushed_paths_cs);
+        path_count = clip->pushed_path_count;
+        if (path_count > 0)
+            memcpy(paths, clip->pushed_paths, sizeof(paths[0]) * (size_t)path_count);
+        LeaveCriticalSection(&clip->pushed_paths_cs);
+
+        if (path_count > 0) {
+            typedef struct { wchar_t name[MAX_PATH]; UINT64 size; DWORD attrs; int is_dir; } MetaEntry;
+            #define META_MAX 4096
+            MetaEntry *entries = (MetaEntry *)HeapAlloc(GetProcessHeap(), 0, sizeof(MetaEntry) * META_MAX);
+            int entry_count = 0;
+            if (entries) {
+                typedef struct { wchar_t full[MAX_PATH]; wchar_t rel[MAX_PATH]; } SItem;
+                SItem *stack = (SItem *)HeapAlloc(GetProcessHeap(), 0, sizeof(SItem) * 1024);
+                int sp = 0;
+                int pi;
+                if (stack) {
+                    for (pi = 0; pi < path_count; pi++) {
+                        if (sp < 1024) {
+                            wcscpy_s(stack[sp].full, MAX_PATH, paths[pi]);
+                            {
+                                wchar_t *bn = wcsrchr(paths[pi], L'\\');
+                                bn = bn ? bn + 1 : paths[pi];
+                                wcscpy_s(stack[sp].rel, MAX_PATH, bn);
+                            }
+                            sp++;
+                        }
+                    }
+                    while (sp > 0 && entry_count < META_MAX) {
+                        SItem cur;
+                        sp--;
+                        cur = stack[sp];
+                        {
+                            DWORD attrs = GetFileAttributesW(cur.full);
+                            if (attrs == INVALID_FILE_ATTRIBUTES) continue;
+                            if (entry_count < META_MAX) {
+                                wcscpy_s(entries[entry_count].name, MAX_PATH, cur.rel);
+                                entries[entry_count].is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+                                if (entries[entry_count].is_dir) {
+                                    entries[entry_count].size = 0;
+                                } else {
+                                    WIN32_FILE_ATTRIBUTE_DATA fad;
+                                    if (GetFileAttributesExW(cur.full, GetFileExInfoStandard, &fad)) {
+                                        entries[entry_count].size = ((UINT64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                                    } else {
+                                        entries[entry_count].size = 0;
+                                    }
+                                }
+                                entries[entry_count].attrs = attrs;
+                                entry_count++;
+                            }
+                            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                                WIN32_FIND_DATAW fd;
+                                wchar_t pattern[MAX_PATH];
+                                HANDLE h;
+                                _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*", cur.full);
+                                h = FindFirstFileW(pattern, &fd);
+                                if (h != INVALID_HANDLE_VALUE) {
+                                    do {
+                                        wchar_t child_full[MAX_PATH], child_rel[MAX_PATH];
+                                        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                                        if (sp + 1 >= 1024) break;
+                                        _snwprintf_s(child_full, MAX_PATH, _TRUNCATE, L"%s\\%s", cur.full, fd.cFileName);
+                                        if (wcslen(cur.rel) + 1 + wcslen(fd.cFileName) < MAX_PATH)
+                                            _snwprintf_s(child_rel, MAX_PATH, _TRUNCATE, L"%s\\%s", cur.rel, fd.cFileName);
+                                        else
+                                            wcscpy_s(child_rel, MAX_PATH, fd.cFileName);
+                                        wcscpy_s(stack[sp].full, MAX_PATH, child_full);
+                                        wcscpy_s(stack[sp].rel, MAX_PATH, child_rel);
+                                        sp++;
+                                    } while (FindNextFileW(h, &fd));
+                                    FindClose(h);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (stack) HeapFree(GetProcessHeap(), 0, stack);
+
+                if (entry_count > 0) {
+                    int bufcap = 1024 * 1024;
+                    BYTE *fbuf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, bufcap);
+                    int off = 4;
+                    int i;
+                    if (fbuf) {
+                        *(UINT32 *)fbuf = (UINT32)entry_count;
+                        for (i = 0; i < entry_count && off < bufcap - 64; i++) {
+                            UINT32 name_len = (UINT32)(wcslen(entries[i].name) * sizeof(wchar_t));
+                            if (off + 4 + (int)name_len + 8 + 4 + 1 > bufcap) break;
+                            *(UINT32 *)(fbuf + off) = name_len; off += 4;
+                            memcpy(fbuf + off, entries[i].name, name_len); off += name_len;
+                            *(UINT64 *)(fbuf + off) = entries[i].size; off += 8;
+                            *(UINT32 *)(fbuf + off) = entries[i].attrs; off += 4;
+                            fbuf[off++] = entries[i].is_dir ? 1 : 0;
+                        }
+                        {
+                            ClipHeader fhdr;
+                            fhdr.magic = CLIP_MAGIC;
+                            fhdr.msg_type = CLIP_MSG_FILE_LIST;
+                            fhdr.format = 0;
+                            fhdr.data_size = (UINT32)off;
+                            EnterCriticalSection(&clip->writer_cs);
+                            clip_send_all(s, &fhdr, sizeof(fhdr));
+                            clip_send_all(s, fbuf, off);
+                            LeaveCriticalSection(&clip->writer_cs);
+                        }
+                        HeapFree(GetProcessHeap(), 0, fbuf);
+                    }
+                }
+                if (entries) HeapFree(GetProcessHeap(), 0, entries);
+            }
+        }
+    }
 }
 
 /* ---- Push worker thread ---- */
@@ -649,11 +807,22 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
         wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
         int path_count = 0;
 
-        /* Snapshot the dropped paths while the clipboard is open, then release
-           it again. Holding OpenClipboard() across a multi-gigabyte transfer
+        /* Serve the files this guest was told about, not whatever happens to be
+           on the clipboard now: a lazy guest only asks for the bytes when the
+           user pastes, which can be long after the FORMAT_LIST was pushed. */
+        EnterCriticalSection(&clip->pushed_paths_cs);
+        path_count = clip->pushed_path_count;
+        if (path_count > 0)
+            memcpy(paths, clip->pushed_paths, sizeof(paths[0]) * (size_t)path_count);
+        LeaveCriticalSection(&clip->pushed_paths_cs);
+
+        /* No snapshot (for example a guest from an older build requested data
+           without a preceding push): fall back to the live clipboard. Snapshot
+           the dropped paths while the clipboard is open, then release it
+           again. Holding OpenClipboard() across a multi-gigabyte transfer
            would lock every other application on the host out of the clipboard
            for the whole transfer. */
-        if (OpenClipboard(NULL)) {
+        if (path_count == 0 && OpenClipboard(NULL)) {
             HANDLE hData = GetClipboardData(CF_HDROP);
             if (hData) {
                 HDROP hDrop = (HDROP)hData;
@@ -729,12 +898,189 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
 
 /* ---- Writer recv thread ---- */
 
+/* Stream one file's bytes for a FileContents request. Flattens the pushed
+   paths the same way the metadata list was flattened. */
+static void clip_handle_file_data_request(VmClipboard clip, SOCKET s, UINT32 idx)
+{
+    /* Collect flattened full paths. */
+    typedef struct { wchar_t full[MAX_PATH]; wchar_t rel[MAX_PATH]; int is_dir; } FEntry;
+    #define F_MAX 4096
+    FEntry *entries = (FEntry *)HeapAlloc(GetProcessHeap(), 0, sizeof(FEntry) * F_MAX);
+    int count = 0;
+    /* iterative DFS over pushed paths */
+    {
+        typedef struct { wchar_t full[MAX_PATH]; wchar_t rel[MAX_PATH]; } SItem;
+        SItem *stack = (SItem *)HeapAlloc(GetProcessHeap(), 0, sizeof(SItem) * 1024);
+        int sp = 0;
+        int pi;
+        /* need pushed paths */
+        wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
+        int path_count = 0;
+        EnterCriticalSection(&clip->pushed_paths_cs);
+        path_count = clip->pushed_path_count;
+        if (path_count > 0)
+            memcpy(paths, clip->pushed_paths, sizeof(paths[0]) * (size_t)path_count);
+        LeaveCriticalSection(&clip->pushed_paths_cs);
+
+        if (stack && entries) {
+            for (pi = 0; pi < path_count; pi++) {
+                if (sp < 1024) {
+                    wcscpy_s(stack[sp].full, MAX_PATH, paths[pi]);
+                    {
+                        wchar_t *bn = wcsrchr(paths[pi], L'\\');
+                        bn = bn ? bn + 1 : paths[pi];
+                        wcscpy_s(stack[sp].rel, MAX_PATH, bn);
+                    }
+                    sp++;
+                }
+            }
+            while (sp > 0 && count < F_MAX) {
+                SItem cur;
+                sp--;
+                cur = stack[sp];
+                {
+                    DWORD attrs = GetFileAttributesW(cur.full);
+                    if (attrs == INVALID_FILE_ATTRIBUTES) continue;
+                    if (count < F_MAX) {
+                        wcscpy_s(entries[count].full, MAX_PATH, cur.full);
+                        wcscpy_s(entries[count].rel, MAX_PATH, cur.rel);
+                        entries[count].is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+                        count++;
+                    }
+                    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                        WIN32_FIND_DATAW fd;
+                        wchar_t pattern[MAX_PATH];
+                        HANDLE h;
+                        _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*", cur.full);
+                        h = FindFirstFileW(pattern, &fd);
+                        if (h != INVALID_HANDLE_VALUE) {
+                            do {
+                                wchar_t child_full[MAX_PATH], child_rel[MAX_PATH];
+                                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                                if (sp + 1 >= 1024) break;
+                                _snwprintf_s(child_full, MAX_PATH, _TRUNCATE, L"%s\\%s", cur.full, fd.cFileName);
+                                if (wcslen(cur.rel) + 1 + wcslen(fd.cFileName) < MAX_PATH)
+                                    _snwprintf_s(child_rel, MAX_PATH, _TRUNCATE, L"%s\\%s", cur.rel, fd.cFileName);
+                                else
+                                    wcscpy_s(child_rel, MAX_PATH, fd.cFileName);
+                                wcscpy_s(stack[sp].full, MAX_PATH, child_full);
+                                wcscpy_s(stack[sp].rel, MAX_PATH, child_rel);
+                                sp++;
+                            } while (FindNextFileW(h, &fd));
+                            FindClose(h);
+                        }
+                    }
+                }
+            }
+            HeapFree(GetProcessHeap(), 0, stack);
+        }
+    }
+
+    if (!entries || (int)idx >= count) {
+        /* Send empty response. */
+        ClipFileInfo fi;
+        ClipHeader hdr;
+        fi.path_len = 0; fi.file_size = 0; fi.is_directory = 0;
+        hdr.magic = CLIP_MAGIC;
+        hdr.msg_type = CLIP_MSG_FILE_DATA;
+        hdr.format = 0;
+        hdr.data_size = (UINT32)sizeof(fi);
+        EnterCriticalSection(&clip->writer_cs);
+        clip_send_all(s, &hdr, sizeof(hdr));
+        clip_send_all(s, &fi, sizeof(fi));
+        LeaveCriticalSection(&clip->writer_cs);
+        if (entries) HeapFree(GetProcessHeap(), 0, entries);
+        return;
+    }
+
+    {
+        FEntry *e = &entries[idx];
+        DWORD attrs = GetFileAttributesW(e->full);
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+            ClipFileInfo fi;
+            ClipHeader hdr;
+            UINT32 name_bytes = (UINT32)(wcslen(e->rel) * sizeof(wchar_t));
+            fi.path_len = name_bytes;
+            fi.file_size = 0;
+            fi.is_directory = 1;
+            hdr.magic = CLIP_MAGIC;
+            hdr.msg_type = CLIP_MSG_FILE_DATA;
+            hdr.format = 0;
+            hdr.data_size = (UINT32)sizeof(fi) + name_bytes;
+            EnterCriticalSection(&clip->writer_cs);
+            clip_send_all(s, &hdr, sizeof(hdr));
+            clip_send_all(s, &fi, sizeof(fi));
+            if (name_bytes > 0) clip_send_all(s, e->rel, (int)name_bytes);
+            LeaveCriticalSection(&clip->writer_cs);
+        } else {
+            HANDLE hFile = CreateFileW(e->full, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            LARGE_INTEGER size;
+            BYTE *chunk;
+            UINT64 remaining;
+            ClipFileInfo fi;
+            ClipHeader hdr;
+            UINT32 name_bytes = (UINT32)(wcslen(e->rel) * sizeof(wchar_t));
+            if (hFile == INVALID_HANDLE_VALUE) {
+                fi.path_len = 0; fi.file_size = 0; fi.is_directory = 0;
+                hdr.magic = CLIP_MAGIC;
+                hdr.msg_type = CLIP_MSG_FILE_DATA;
+                hdr.format = 0;
+                hdr.data_size = (UINT32)sizeof(fi);
+                EnterCriticalSection(&clip->writer_cs);
+                clip_send_all(s, &hdr, sizeof(hdr));
+                clip_send_all(s, &fi, sizeof(fi));
+                LeaveCriticalSection(&clip->writer_cs);
+                if (entries) HeapFree(GetProcessHeap(), 0, entries);
+                return;
+            }
+            GetFileSizeEx(hFile, &size);
+            fi.path_len = name_bytes;
+            fi.file_size = (UINT64)size.QuadPart;
+            fi.is_directory = 0;
+            hdr.magic = CLIP_MAGIC;
+            hdr.msg_type = CLIP_MSG_FILE_DATA;
+            hdr.format = 0;
+            hdr.data_size = (UINT32)sizeof(fi) + name_bytes;
+            chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
+            EnterCriticalSection(&clip->writer_cs);
+            clip_send_all(s, &hdr, sizeof(hdr));
+            clip_send_all(s, &fi, sizeof(fi));
+            if (name_bytes > 0) clip_send_all(s, e->rel, (int)name_bytes);
+            remaining = fi.file_size;
+            if (chunk) {
+                while (remaining > 0) {
+                    DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
+                    DWORD bytes_read;
+                    if (!ReadFile(hFile, chunk, to_read, &bytes_read, NULL) || bytes_read == 0) break;
+                    clip_send_all(s, chunk, (int)bytes_read);
+                    remaining -= bytes_read;
+                }
+            }
+            LeaveCriticalSection(&clip->writer_cs);
+            if (chunk) HeapFree(GetProcessHeap(), 0, chunk);
+            CloseHandle(hFile);
+        }
+    }
+
+    if (entries) HeapFree(GetProcessHeap(), 0, entries);
+}
+
 static BOOL clip_writer_handle_message(VmClipboard clip, SOCKET s, const ClipHeader *hdr)
 {
     switch (hdr->msg_type) {
     case CLIP_MSG_FORMAT_DATA_REQ:
         clip_handle_data_request(clip, hdr->format);
         return TRUE;
+    case CLIP_MSG_FILE_DATA_REQ: {
+        /* Guest requests one file's bytes (FileContents). hdr->data_size carries
+           the 4-byte index into the pushed (flattened) file list. */
+        UINT32 idx = 0;
+        if (hdr->data_size >= 4) {
+            if (!clip_recv_exact(s, &idx, 4)) return FALSE;
+        }
+        clip_handle_file_data_request(clip, s, idx);
+        return TRUE;
+    }
     default:
         if (hdr->data_size > 0) {
             BYTE skip[256];
@@ -1132,9 +1478,11 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->pending_push = 0;
     clip->pushed_seq = 0;
     clip->pushed_seq_valid = 0;
+    clip->pushed_path_count = 0;
 
     InitializeCriticalSection(&clip->writer_cs);
     InitializeCriticalSection(&clip->reader_cs);
+    InitializeCriticalSection(&clip->pushed_paths_cs);
 
     clip->push_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
@@ -1211,6 +1559,7 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
 
     DeleteCriticalSection(&clip->writer_cs);
     DeleteCriticalSection(&clip->reader_cs);
+    DeleteCriticalSection(&clip->pushed_paths_cs);
 
     HeapFree(GetProcessHeap(), 0, clip);
 }
