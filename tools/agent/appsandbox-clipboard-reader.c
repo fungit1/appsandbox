@@ -148,8 +148,24 @@ static BOOL send_all_locked(const void *buf, int len)
 
 /* ---- Skip non-transferable formats ---- */
 
+/* OLE "shell file" formats.  The guest clipboard writer advertises files with
+ * FileGroupDescriptorW + FileContents (lazy, streamed on paste); those cannot
+ * be read with GetClipboardData() and must never be echoed back to the host.
+ * The normal guest->host file path is CF_HDROP. */
+static UINT g_cf_file_desc_w = 0;
+static UINT g_cf_file_desc_a = 0;
+static UINT g_cf_file_contents = 0;
+static UINT g_cf_file_name_w = 0;
+static UINT g_cf_file_name_a = 0;
+
 static BOOL should_skip_format(UINT fmt)
 {
+    if (fmt != 0 &&
+        (fmt == g_cf_file_desc_w || fmt == g_cf_file_desc_a ||
+         fmt == g_cf_file_contents ||
+         fmt == g_cf_file_name_w || fmt == g_cf_file_name_a))
+        return TRUE;
+
     switch (fmt) {
     case 0:
     case CF_BITMAP:
@@ -303,8 +319,11 @@ static void clip_send_format_list(void)
     CloseClipboard();
 
     if (count == 0) {
-        reader_log("No formats to send.");
-        return;
+        /* An empty list is still sent: the host pairs every push with one
+           echoed FORMAT_LIST to suppress it, and a discarded echo would make
+           the next genuine guest copy disappear.  A zero-format list is a
+           no-op for old and new hosts. */
+        reader_log("No transferable formats; sending empty list.");
     }
 
     *(UINT32 *)buf = count;
@@ -555,6 +574,12 @@ int main(void)
                WTSGetActiveConsoleSessionId());
 
     InitializeCriticalSection(&g_send_cs);
+
+    g_cf_file_desc_w   = RegisterClipboardFormatW(L"FileGroupDescriptorW");
+    g_cf_file_desc_a   = RegisterClipboardFormatW(L"FileGroupDescriptor");
+    g_cf_file_contents = RegisterClipboardFormatW(L"FileContents");
+    g_cf_file_name_w   = RegisterClipboardFormatW(L"FileNameW");
+    g_cf_file_name_a   = RegisterClipboardFormatW(L"FileName");
 
     g_sync_event = OpenEventW(SYNCHRONIZE, FALSE, CLIP_SYNC_EVENT_NAME);
     if (!g_sync_event)
