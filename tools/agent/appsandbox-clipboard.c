@@ -14,7 +14,8 @@
  * Guest→host clipboard is handled separately by appsandbox-clipboard-reader.exe
  * (USER, GUID :0006).
  *
- * Logs to C:\Windows\AppSandbox\clipboard.log (beside agent.log).
+ * Runs as the interactive user, so it logs to %TEMP%\clipboard.log (beside
+ * clipboard-reader.log); C:\Windows\AppSandbox is not writable for that user.
  */
 
 #include <winsock2.h>
@@ -23,6 +24,7 @@
 #include <userenv.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <objbase.h>
@@ -124,22 +126,36 @@ typedef struct {
 static FileMeta g_file_meta[META_MAX];
 static int      g_file_meta_count = 0;
 
-/* On-demand file transfer for FileContents.  Only one file is streamed at a
- * time: the shell copies items sequentially and COM serialises calls into our
- * STA.  The recv thread fills the temp file while the IStream reader drains it,
- * so Explorer's progress dialog advances during the transfer instead of
- * waiting for the whole file. */
+/* On-demand file transfer for FileContents.  The network only carries one file
+ * at a time, but several IStreams may exist at once (Explorer starts one per
+ * file and can run a few in parallel).  Each stream owns its own staging file;
+ * g_xfer_gen identifies which request the shared "currently streaming" state
+ * belongs to.  A stream whose generation is no longer current knows its own
+ * transfer already finished and reads its private file to EOF.  The recv
+ * thread fills the temp file while the IStream reader drains it, so Explorer's
+ * progress dialog advances during the transfer instead of waiting for the
+ * whole file. */
+struct FileContentsStream;   /* defined below; see g_active_stream */
+
 static volatile LONG g_file_req_pending = 0;  /* recv thread must fetch */
 static volatile LONG g_file_req_idx = 0;
 static CRITICAL_SECTION g_xfer_cs;
-static HANDLE g_xfer_event = NULL;   /* auto-reset: new bytes or transfer done */
-static HANDLE g_xfer_start = NULL;   /* auto-reset: temp file created */
+static HANDLE g_slot_event = NULL;   /* manual-reset: wire slot is free */
+static struct FileContentsStream *g_active_stream = NULL; /* slot owner */
 static int      g_xfer_active = 0;
 static int      g_xfer_done = 0;
 static int      g_xfer_error = 0;
-static UINT64   g_xfer_written = 0;
+static volatile LONG g_xfer_cancel = 0; /* paste abandoned: drain, don't write */
+static volatile LONG g_xfer_dead = 0;  /* recv thread is gone: no more bytes */
 static UINT64   g_xfer_total = 0;
-static wchar_t  g_xfer_path[MAX_PATH];
+static wchar_t  g_xfer_path[MAX_PATH];    /* staging file of the active request */
+static HANDLE   g_xfer_hFile = NULL;      /* duplicate for the recv thread */
+static volatile LONG g_xfer_gen = 0;      /* generation of the active request */
+static wchar_t  g_req_name[MAX_PATH];     /* expected relative name of it */
+
+/* Lazy staging files live outside g_clip_temp_dir: a new FORMAT_LIST wipes
+   that directory, which must never delete a file an in-flight paste reads. */
+static wchar_t g_lazy_dir[MAX_PATH];
 
 /* Echo suppression */
 static volatile LONG g_suppress = 0;
@@ -179,13 +195,36 @@ static volatile LONG g_applied_has_nonfile = 0;
 
 /* ---- Logging ---- */
 
+/* The clipboard helper is started with CreateProcessAsUserW (see
+   spawn_clipboard_in_session in agent.c), i.e. it runs as the logged-in user,
+   not as SYSTEM.  The user cannot create files in C:\Windows\AppSandbox, so the
+   old hard-coded log was silently never written.  Log next to
+   clipboard-reader.log in the user's temp directory instead: that is where the
+   reader already keeps its log, and it is always writable. */
+static char g_log_path[MAX_PATH] = "";
+
+static const char *clip_log_path(void)
+{
+    if (!g_log_path[0]) {
+        char tmp[MAX_PATH];
+
+        if (GetTempPathA(MAX_PATH, tmp) > 0 &&
+            strlen(tmp) + strlen("clipboard.log") + 1 < MAX_PATH)
+            sprintf_s(g_log_path, MAX_PATH, "%sclipboard.log", tmp);
+        else
+            lstrcpynA(g_log_path, "C:\\Windows\\AppSandbox\\clipboard.log",
+                      MAX_PATH);
+    }
+    return g_log_path;
+}
+
 static void clip_log(const char *fmt, ...)
 {
     FILE *f;
     va_list ap;
     SYSTEMTIME st;
 
-    if (fopen_s(&f, "C:\\Windows\\AppSandbox\\clipboard.log", "a") != 0 || !f)
+    if (fopen_s(&f, clip_log_path(), "a") != 0 || !f)
         return;
     GetLocalTime(&st);
     fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] ",
@@ -239,8 +278,10 @@ static void clip_init_temp_dir(void)
         if (ExpandEnvironmentStringsForUserW(user_token, L"%TEMP%",
                                               tmp, MAX_PATH)) {
             swprintf_s(g_clip_temp_dir, MAX_PATH, L"%s\\AppSandboxClip", tmp);
+            swprintf_s(g_lazy_dir, MAX_PATH, L"%s\\AppSandboxClipLazy", tmp);
             CloseHandle(user_token);
             CreateDirectoryW(g_clip_temp_dir, NULL);
+            CreateDirectoryW(g_lazy_dir, NULL);
             clip_log("Temp dir: %ls", g_clip_temp_dir);
             return;
         }
@@ -250,7 +291,9 @@ static void clip_init_temp_dir(void)
     /* Fallback: SYSTEM temp (should not normally happen) */
     GetTempPathW(MAX_PATH, tmp);
     swprintf_s(g_clip_temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
+    swprintf_s(g_lazy_dir, MAX_PATH, L"%sAppSandboxClipLazy", tmp);
     CreateDirectoryW(g_clip_temp_dir, NULL);
+    CreateDirectoryW(g_lazy_dir, NULL);
     clip_log("Temp dir (fallback): %ls", g_clip_temp_dir);
 }
 
@@ -430,7 +473,7 @@ typedef struct {
     int meta_count;
 } AsbDO;
 
-typedef struct {
+typedef struct FileContentsStream {
     IStreamVtbl *lpVtbl;
     LONG ref;
     int index;
@@ -438,13 +481,26 @@ typedef struct {
     UINT64 pos;
     HANDLE hFile;
     wchar_t temp_path[MAX_PATH];
+    wchar_t rel_name[MAX_PATH];   /* expected name from the advertised list */
+    LONG gen;                     /* request generation this stream owns */
     int started;
+    int finished;
+    int abandoned;                /* paste released this stream (under g_xfer_cs) */
+    int seek_logs;                /* bound Seek diagnostics */
+    DWORD thread_id;              /* STA thread that services this stream */
+    HANDLE data_event;            /* auto-reset: bytes arrived or transfer done */
 } FileContentsStream;
 
 static IStreamVtbl FCS_Vtbl;
 static IEnumFORMATETCVtbl EN_Vtbl;
 
 /* ---------- IStream: reads straight from the growing temp file ---------- */
+
+/* Abandoning a paste (the shell releases its IStream) must not take the whole
+   clipboard channel down: several pastes can share this connection, and a
+   teardown used to make one bad job fail every other one.  The body of the
+   abandoned request is drained and discarded instead, which keeps the wire in
+   sync and frees the slot for the next paste.  See g_xfer_cancel. */
 
 static HRESULT STDMETHODCALLTYPE FCS_QueryInterface(IStream *this, REFIID riid, void **ppv)
 {
@@ -468,110 +524,406 @@ static ULONG STDMETHODCALLTYPE FCS_Release(IStream *this)
     FileContentsStream *s = (FileContentsStream *)this;
     ULONG r = (ULONG)InterlockedDecrement(&s->ref);
     if (r == 0) {
+        int cancelled = 0;
+        HANDLE data_event;
+
+        /* Released before its bytes arrived: this paste was abandoned.  Ask the
+           recv thread to stop writing and drain the rest of the body. */
+        EnterCriticalSection(&g_xfer_cs);
+        if (g_active_stream == s) g_active_stream = NULL;
+        s->abandoned = 1;
+        if (s->started && !s->finished &&
+            s->pos < s->declared_size &&
+            s->gen == g_xfer_gen && g_xfer_active && !g_xfer_done) {
+            InterlockedExchange(&g_xfer_cancel, 1);
+            cancelled = 1;
+        }
+        data_event = s->data_event;
+        s->data_event = NULL;
+        LeaveCriticalSection(&g_xfer_cs);
+
+        clip_log("Released stream %d gen %ld pos %llu/%llu started %d finished %d cancel %d.",
+                 s->index, (long)s->gen,
+                 (unsigned long long)s->pos,
+                 (unsigned long long)s->declared_size,
+                 s->started ? 1 : 0, s->finished ? 1 : 0, cancelled);
+
+        if (cancelled)
+            clip_log("Lazy stream %d abandoned; draining the rest of the body "
+                     "(connection stays up).", s->index);
+
+        if (data_event) CloseHandle(data_event);
+
         if (s->hFile && s->hFile != INVALID_HANDLE_VALUE) CloseHandle(s->hFile);
         if (s->temp_path[0]) DeleteFileW(s->temp_path);
+        /* Stop this stream's STA message loop (if it is already exiting or
+           running on this same thread, the posted WM_QUIT is harmless). */
+        if (s->thread_id) PostThreadMessageW(s->thread_id, WM_QUIT, 0, 0);
         HeapFree(GetProcessHeap(), 0, s);
     }
     return r;
 }
 
-/* Ask the recv thread to fetch this item.  Waits for any earlier (possibly
-   abandoned) transfer to finish, so there is only ever one in flight. */
+/* Pump posted messages for this thread.  Each FileContents stream is serviced
+   on its own STA (see fcs_thread_proc), so this only dispatches COM calls for
+   that one stream; the pump is still required because otherwise a cancel
+   (Release) could not be delivered while Read() is waiting for bytes. */
+static void fcs_pump_messages(void)
+{
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+/* Wait for one event without starving the apartment. */
+static DWORD fcs_wait_event(HANDLE ev, DWORD ms)
+{
+    ULONGLONG deadline = GetTickCount64() + ms;
+
+    if (!ev) return WAIT_TIMEOUT;
+    for (;;) {
+        DWORD remain, r;
+        ULONGLONG now = GetTickCount64();
+
+        if (now >= deadline) return WAIT_TIMEOUT;
+        remain = (DWORD)(deadline - now);
+        r = MsgWaitForMultipleObjects(1, &ev, FALSE, remain, QS_ALLINPUT);
+        if (r == WAIT_OBJECT_0) return WAIT_OBJECT_0;
+        if (r == WAIT_TIMEOUT) return WAIT_TIMEOUT;
+        if (r == WAIT_OBJECT_0 + 1) fcs_pump_messages();
+        else return r;
+    }
+}
+
+/* Wake the stream that currently owns the wire slot.  Called by the recv
+   thread after it writes bytes.  The pointer is protected by g_xfer_cs so a
+   concurrent stream release cannot free it underneath us. */
+static void fcs_signal_data(void)
+{
+    EnterCriticalSection(&g_xfer_cs);
+    if (g_active_stream && g_active_stream->data_event)
+        SetEvent(g_active_stream->data_event);
+    LeaveCriticalSection(&g_xfer_cs);
+}
+
+/* Finish the active transfer, wake its reader and free the wire slot. */
+static void fcs_finish_transfer(int error)
+{
+    EnterCriticalSection(&g_xfer_cs);
+    if (error) g_xfer_error = 1;
+    g_xfer_done = 1;
+    if (g_active_stream && g_active_stream->data_event)
+        SetEvent(g_active_stream->data_event);
+    g_active_stream = NULL;
+    InterlockedExchange(&g_file_req_pending, 0);
+    g_xfer_active = 0;
+    SetEvent(g_slot_event);   /* manual-reset: stays free until claimed */
+    LeaveCriticalSection(&g_xfer_cs);
+}
+
+/* Claim the single network transfer slot and create this stream's own staging
+   file.  Creating the file here (rather than in the recv thread) means a newer
+   request can never overwrite the path of an older stream that has not opened
+   its file yet. */
 static BOOL fcs_start_request(FileContentsStream *s)
 {
-    for (;;) {
-        BOOL active;
-        EnterCriticalSection(&g_xfer_cs);
-        active = g_xfer_active ? TRUE : FALSE;
-        LeaveCriticalSection(&g_xfer_cs);
-        if (!active) break;
-        WaitForSingleObject(g_xfer_event, 200);
+    wchar_t tmp[MAX_PATH];
+    HANDLE hf;
+    LONG gen;
+    ULONGLONG last_wait_log = GetTickCount64();
+
+    /* This stream's own wake-up event must exist before the recv thread can
+       signal bytes, and is separate from the slot event so waiters never
+       consume each other's notifications. */
+    if (!s->data_event) {
+        s->data_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!s->data_event) {
+            clip_log("Lazy stream %d: CreateEvent failed (%lu).",
+                     s->index, GetLastError());
+            return FALSE;
+        }
     }
 
+    /* Several files can be pasted at once; only one travels on the wire at a
+       time, so waiting for the slot is normal and must not be bounded by the
+       per-transfer inactivity timeout.  Only a dead recv thread aborts it. */
+    for (;;) {
+        EnterCriticalSection(&g_xfer_cs);
+        if (g_xfer_dead) {
+            LeaveCriticalSection(&g_xfer_cs);
+            clip_log("Lazy stream %d: connection closed while queued.", s->index);
+            return FALSE;
+        }
+        if (!g_xfer_active) {
+            /* The paste was abandoned while this stream was still queued: do
+               not claim the wire and download a file nobody will read. */
+            if (s->abandoned) {
+                LeaveCriticalSection(&g_xfer_cs);
+                clip_log("Lazy stream %d: abandoned while queued; not requesting.",
+                         s->index);
+                return FALSE;
+            }
+            g_xfer_active  = 1;
+            g_xfer_done    = 0;
+            g_xfer_error   = 0;
+            InterlockedExchange(&g_xfer_cancel, 0);
+            g_xfer_total   = s->declared_size;
+            gen = ++g_xfer_gen;
+            s->gen = gen;
+            /* Mark it started while holding the lock so a concurrent Release
+               cancels the transfer instead of racing the staging file. */
+            s->started = 1;
+            wcscpy_s(g_req_name, MAX_PATH, s->rel_name);
+            g_file_req_idx = s->index;
+            g_active_stream = s;
+            ResetEvent(s->data_event);
+            ResetEvent(g_slot_event);
+            LeaveCriticalSection(&g_xfer_cs);
+            break;
+        }
+        LeaveCriticalSection(&g_xfer_cs);
+        /* Log occasionally so a genuinely wedged queue is visible in the log. */
+        if (GetTickCount64() - last_wait_log >= 30000) {
+            last_wait_log = GetTickCount64();
+            clip_log("Lazy stream %d: still waiting for the wire (gen %ld).",
+                     s->index, (long)g_xfer_gen);
+        }
+        fcs_wait_event(g_slot_event, 200);
+    }
+
+    CreateDirectoryW(g_lazy_dir, NULL);
+    {
+        ULARGE_INTEGER freeb;
+        if (GetDiskFreeSpaceExW(g_lazy_dir, &freeb, NULL, NULL))
+            clip_log("Lazy staging '%ls' has %llu MB free.",
+                     g_lazy_dir,
+                     (unsigned long long)(freeb.QuadPart / (1024 * 1024)));
+    }
+    swprintf_s(tmp, MAX_PATH, L"%s\\_fc_%ld_%d.tmp",
+               g_lazy_dir, (long)gen, s->index);
+    hf = CreateFileW(tmp, GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) {
+        clip_log("Lazy stream %d: cannot create staging file '%ls' (%lu).",
+                 s->index, tmp, GetLastError());
+        fcs_finish_transfer(1);
+        return FALSE;
+    }
+
+    s->hFile = hf;
+    wcscpy_s(s->temp_path, MAX_PATH, tmp);
+
+    /* Released between the claim and the request: give the slot back now so
+       the next paste does not wait for a body nobody asked for. */
     EnterCriticalSection(&g_xfer_cs);
-    ResetEvent(g_xfer_event);
-    ResetEvent(g_xfer_start);
-    g_xfer_active  = 1;
-    g_xfer_done    = 0;
-    g_xfer_error   = 0;
-    g_xfer_written = 0;
-    g_xfer_total   = s->declared_size;
-    g_xfer_path[0] = L'\0';
+    if (s->abandoned) {
+        LeaveCriticalSection(&g_xfer_cs);
+        CloseHandle(hf);
+        s->hFile = INVALID_HANDLE_VALUE;
+        s->temp_path[0] = L'\0';
+        DeleteFileW(tmp);
+        fcs_finish_transfer(0);
+        clip_log("Lazy stream %d: abandoned before the request; slot released.",
+                 s->index);
+        return FALSE;
+    }
     LeaveCriticalSection(&g_xfer_cs);
 
-    g_file_req_idx = s->index;
-    InterlockedExchange(&g_file_req_pending, 1);
-    s->started = 1;
+    /* Give the recv thread its own *file object* (a fresh open, not a
+       DuplicateHandle: a duplicate shares the one file pointer with the
+       stream, and the stream seeks around while the body is being written, so
+       the writer would land at the reader's offset and corrupt the staged
+       data).  Release deletes the path, which must not pull the file out from
+       under a request that is already being served (ERROR_FILE_NOT_FOUND);
+       the open handle keeps the file usable until it is closed. */
+    {
+        HANDLE serve = CreateFileW(tmp, GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                       FILE_SHARE_DELETE,
+                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                                   NULL);
+        if (serve == INVALID_HANDLE_VALUE) {
+            clip_log("Lazy stream %d: cannot reopen staging file '%ls' (%lu).",
+                     s->index, tmp, GetLastError());
+            CloseHandle(hf);
+            s->hFile = INVALID_HANDLE_VALUE;
+            DeleteFileW(tmp);
+            fcs_finish_transfer(1);
+            return FALSE;
+        }
+        EnterCriticalSection(&g_xfer_cs);
+        if (g_xfer_hFile && g_xfer_hFile != INVALID_HANDLE_VALUE)
+            CloseHandle(g_xfer_hFile);
+        g_xfer_hFile = serve;
+        wcscpy_s(g_xfer_path, MAX_PATH, tmp);
+        InterlockedExchange(&g_file_req_pending, 1);
+        LeaveCriticalSection(&g_xfer_cs);
+    }
+
+    clip_log("Lazy stream %d (%ls): got wire slot gen %ld.",
+             s->index, s->rel_name, (long)gen);
     return TRUE;
 }
 
-/* Wait for the recv thread to create the temp file and open it for reading. */
-static BOOL fcs_open_temp(FileContentsStream *s)
-{
-    wchar_t path[MAX_PATH];
-    int error;
-
-    path[0] = L'\0';
-    WaitForSingleObject(g_xfer_start, 120000);
-
-    EnterCriticalSection(&g_xfer_cs);
-    error = g_xfer_error;
-    if (g_xfer_path[0]) wcscpy_s(path, MAX_PATH, g_xfer_path);
-    LeaveCriticalSection(&g_xfer_cs);
-
-    if (error || !path[0]) return FALSE;
-
-    s->hFile = CreateFileW(path, GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (s->hFile == INVALID_HANDLE_VALUE) return FALSE;
-    wcscpy_s(s->temp_path, MAX_PATH, path);
-    return TRUE;
-}
-
-static HRESULT STDMETHODCALLTYPE FCS_Read(IStream *this, void *pv, ULONG cb, ULONG *pcbRead)
+static HRESULT fcs_read_impl(IStream *this, void *pv, ULONG cb, ULONG *pcbRead)
 {
     FileContentsStream *s = (FileContentsStream *)this;
     DWORD got = 0;
+    UINT64 last_size = 0;
+    ULONGLONG last_progress;
+    ULONGLONG last_log = GetTickCount64();
 
     if (pcbRead) *pcbRead = 0;
     if (cb == 0) return S_OK;
 
-    if (!s->started) {
-        if (!fcs_start_request(s)) return E_FAIL;
-        if (!fcs_open_temp(s)) return E_FAIL;
+    if (!s->started)
+        clip_log("Stream %d first Read (cb=%lu, size=%llu).",
+                 s->index, cb, (unsigned long long)s->declared_size);
+
+    if (s->declared_size == 0) {
+        s->finished = 1;
+        return S_FALSE;
     }
-    if (!s->hFile || s->hFile == INVALID_HANDLE_VALUE) return E_FAIL;
+
+    if (!s->started) {
+        if (!fcs_start_request(s)) {
+            clip_log("Lazy stream %d (%ls): could not start request.",
+                     s->index, s->rel_name);
+            s->finished = 1;
+            return E_FAIL;
+        }
+    }
+    if (!s->hFile || s->hFile == INVALID_HANDLE_VALUE) {
+        clip_log("Lazy stream %d (%ls): invalid staging handle.", s->index, s->rel_name);
+        s->finished = 1;
+        return E_FAIL;
+    }
+
+    /* The inactivity watchdog must measure real transfer progress.  Waiting in
+       the queue above can legitimately take a long time when several files are
+       pasted together, and must not count as "no progress". */
+    last_progress = GetTickCount64();
 
     for (;;) {
+        LARGE_INTEGER fsz;
         UINT64 avail;
-        int done, error;
+        int done, error, abandoned;
+
+        /* The recv thread writes this stream's private file.  Its current size
+           is the authoritative byte count; no shared progress counter. */
+        if (!GetFileSizeEx(s->hFile, &fsz)) {
+            clip_log("Lazy stream %d (%ls): GetFileSizeEx failed (%lu).",
+                     s->index, s->rel_name, GetLastError());
+            s->finished = 1;
+            return E_FAIL;
+        }
+        avail = (UINT64)fsz.QuadPart;
 
         EnterCriticalSection(&g_xfer_cs);
-        avail = g_xfer_written;
-        done  = g_xfer_done;
-        error = g_xfer_error;
+        abandoned = s->abandoned;
+        if (s->gen == g_xfer_gen) {
+            done  = g_xfer_done;
+            error = g_xfer_error;
+        } else {
+            /* A newer request started: this one has already finished (the
+               slot is only released after the body was fully read/written). */
+            done  = 1;
+            error = (avail < s->declared_size) ? 1 : 0;
+        }
         LeaveCriticalSection(&g_xfer_cs);
 
-        if (s->pos < avail) {
+        if (s->pos < avail && s->pos < s->declared_size) {
             UINT64 n = avail - s->pos;
             LARGE_INTEGER off;
             if (n > cb) n = cb;
             off.QuadPart = (LONGLONG)s->pos;
-            if (!SetFilePointerEx(s->hFile, off, NULL, FILE_BEGIN)) return E_FAIL;
-            if (!ReadFile(s->hFile, pv, (DWORD)n, &got, NULL)) return E_FAIL;
+            if (!SetFilePointerEx(s->hFile, off, NULL, FILE_BEGIN)) {
+                clip_log("Lazy stream %d (%ls): SetFilePointerEx failed (%lu).",
+                         s->index, s->rel_name, GetLastError());
+                s->finished = 1;
+                return E_FAIL;
+            }
+            if (!ReadFile(s->hFile, pv, (DWORD)n, &got, NULL)) {
+                clip_log("Lazy stream %d (%ls): ReadFile failed (%lu).",
+                         s->index, s->rel_name, GetLastError());
+                s->finished = 1;
+                return E_FAIL;
+            }
+            if (s->pos == 0 && got > 0)
+                clip_log("Stream %d first data: pos %llu -> %llu of %llu "
+                         "(cb=%lu got=%lu avail=%llu).",
+                         s->index, (unsigned long long)s->pos,
+                         (unsigned long long)(s->pos + got),
+                         (unsigned long long)s->declared_size, cb, got,
+                         (unsigned long long)avail);
             s->pos += got;
             if (pcbRead) *pcbRead = got;
             return got ? S_OK : E_FAIL;
         }
 
-        if (done) {
-            if (error) return E_FAIL;
+        if (s->pos >= s->declared_size) {
+            s->finished = 1;
             return S_FALSE;          /* clean end of stream */
         }
 
-        WaitForSingleObject(g_xfer_event, 1000);
+        if (abandoned) {
+            /* The paste was abandoned: the recv thread is draining the rest of
+               the body, but nobody will read this stream again.  Leave now
+               instead of waiting for the inactivity watchdog. */
+            s->finished = 1;
+            return S_FALSE;
+        }
+
+        if (done) {
+            clip_log("Stream %d ended: pos=%llu/%llu avail=%llu error=%d.",
+                     s->index, (unsigned long long)s->pos,
+                     (unsigned long long)s->declared_size,
+                     (unsigned long long)avail, error);
+            s->finished = 1;
+            return error ? E_FAIL : S_FALSE;
+        }
+
+        /* A paste must never hang: fail if the peer stopped sending. */
+        if (avail != last_size) {
+            last_size = avail;
+            last_progress = GetTickCount64();
+        } else if (GetTickCount64() - last_progress >= 60000) {
+            clip_log("Lazy stream %d (%ls): no data for 60 s "
+                     "(gen %ld, pos %llu/%llu).",
+                     s->index, s->rel_name, (long)s->gen,
+                     (unsigned long long)s->pos,
+                     (unsigned long long)s->declared_size);
+            s->finished = 1;
+            return E_FAIL;
+        }
+
+        if (GetTickCount64() - last_log >= 5000) {
+            last_log = GetTickCount64();
+            clip_log("Stream %d waiting: pos=%llu avail=%llu declared=%llu "
+                     "done=%d error=%d.",
+                     s->index, (unsigned long long)s->pos,
+                     (unsigned long long)avail,
+                     (unsigned long long)s->declared_size, done, error);
+        }
+
+        fcs_wait_event(s->data_event, 1000);
     }
+}
+
+/* Hold an extra reference for the duration of Read so a cancel delivered
+   while we are waiting cannot free the stream underneath the call. */
+static HRESULT STDMETHODCALLTYPE FCS_Read(IStream *this, void *pv, ULONG cb, ULONG *pcbRead)
+{
+    FileContentsStream *s = (FileContentsStream *)this;
+    HRESULT hr;
+
+    InterlockedIncrement(&s->ref);
+    hr = fcs_read_impl(this, pv, cb, pcbRead);
+    s->lpVtbl->Release(this);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE FCS_Write(IStream *this, const void *pv, ULONG cb, ULONG *pcbWritten)
@@ -598,6 +950,13 @@ static HRESULT STDMETHODCALLTYPE FCS_Seek(IStream *this, LARGE_INTEGER dlibMove,
     np = base + dlibMove.QuadPart;
     if (np < 0) return STG_E_INVALIDFUNCTION;
 
+    if (s->seek_logs < 16) {
+        s->seek_logs++;
+        clip_log("Stream %d Seek(origin=%lu, move=%lld): %llu -> %llu of %llu.",
+                 s->index, dwOrigin, (long long)dlibMove.QuadPart,
+                 (unsigned long long)s->pos, (unsigned long long)np,
+                 (unsigned long long)s->declared_size);
+    }
     s->pos = (UINT64)np;
     if (plibNewPosition) plibNewPosition->QuadPart = (ULONGLONG)np;
     return S_OK;
@@ -629,15 +988,19 @@ static HRESULT STDMETHODCALLTYPE FCS_CopyTo(IStream *this, IStream *pstm, ULARGE
     while (left > 0) {
         ULONG want = left > sizeof(buf) ? (ULONG)sizeof(buf) : (ULONG)left;
         ULONG got = 0, written = 0;
-        HRESULT hr = FCS_Read(this, buf, want, &got);
-        if (FAILED(hr)) return hr;
+        HRESULT rh = FCS_Read(this, buf, want, &got);
+        if (FAILED(rh)) return rh;
         if (got == 0) break;
         rd += got;
-        hr = pstm->lpVtbl->Write(pstm, buf, got, &written);
-        if (FAILED(hr)) return hr;
+        {
+            HRESULT wh = pstm->lpVtbl->Write(pstm, buf, got, &written);
+            if (FAILED(wh)) return wh;
+        }
         wr += written;
         left -= got;
-        if (hr == S_FALSE) break;
+        /* The read result, not the write result, says whether the source
+           ended.  A short read that is not S_FALSE just means "more to come". */
+        if (rh == S_FALSE) break;
     }
 
     if (pcbRead) pcbRead->QuadPart = rd;
@@ -679,6 +1042,8 @@ static HRESULT STDMETHODCALLTYPE FCS_Stat(IStream *this, STATSTG *pstatstg, DWOR
     ZeroMemory(pstatstg, sizeof(*pstatstg));
     pstatstg->type = STGTY_STREAM;
     pstatstg->cbSize.QuadPart = s->declared_size;
+    clip_log("Stream %d Stat -> %llu bytes.",
+             s->index, (unsigned long long)s->declared_size);
     return S_OK;
 }
 
@@ -807,6 +1172,88 @@ static ULONG STDMETHODCALLTYPE DO_Release(IDataObject *this)
     return r;
 }
 
+/* ---- Per-stream STA -----------------------------------------------------
+   Explorer can start several FileContents streams at the same time.  If they
+   all lived on the clipboard owner's single STA, a Read() waiting for the
+   wire slot (a second paste while the first file is still streaming) would
+   block every other stream in that apartment, freezing both progress bars.
+   Each stream is therefore created on its own STA and the clipboard thread
+   receives a marshalled proxy, so one blocked stream never stalls another. */
+typedef struct {
+    int index;
+    UINT64 size;
+    wchar_t rel_name[MAX_PATH];
+    HANDLE ready;         /* worker -> clipboard thread: stream is marshalled */
+    HANDLE unmarshalled;  /* clipboard thread -> worker: proxy has been made */
+    IStream *marshal;     /* CoMarshalInterThreadInterfaceInStream result */
+    HRESULT hr;
+} FcsCreateParams;
+
+static DWORD WINAPI fcs_thread_proc(LPVOID param)
+{
+    FcsCreateParams *p = (FcsCreateParams *)param;
+    FileContentsStream *s;
+    HANDLE ready = p->ready;
+    HANDLE unmarshalled = p->unmarshalled;
+    HRESULT hr = E_FAIL;
+    MSG msg;
+
+    if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) {
+        p->hr = E_FAIL;
+        SetEvent(ready);
+        WaitForSingleObject(unmarshalled, INFINITE);
+        CloseHandle(ready);
+        CloseHandle(unmarshalled);
+        HeapFree(GetProcessHeap(), 0, p);
+        return 0;
+    }
+
+    s = (FileContentsStream *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*s));
+    if (!s) {
+        p->hr = E_OUTOFMEMORY;
+        SetEvent(ready);
+        WaitForSingleObject(unmarshalled, INFINITE);
+        CloseHandle(ready);
+        CloseHandle(unmarshalled);
+        HeapFree(GetProcessHeap(), 0, p);
+        CoUninitialize();
+        return 0;
+    }
+
+    s->lpVtbl = &FCS_Vtbl;
+    s->ref = 1;
+    s->index = p->index;
+    s->declared_size = p->size;
+    wcscpy_s(s->rel_name, MAX_PATH, p->rel_name);
+    s->hFile = INVALID_HANDLE_VALUE;
+    s->thread_id = GetCurrentThreadId();
+    s->data_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+
+    hr = CoMarshalInterThreadInterfaceInStream(&IID_IStream, (IUnknown *)s,
+                                               &p->marshal);
+    p->hr = hr;
+    SetEvent(ready);
+
+    /* Keep our own reference until the clipboard thread has unmarshalled the
+       proxy.  The caller must not touch *p after SetEvent(unmarshalled); this
+       thread owns and frees it from here on. */
+    WaitForSingleObject(unmarshalled, INFINITE);
+    s->lpVtbl->Release((IStream *)s);
+    CloseHandle(ready);
+    CloseHandle(unmarshalled);
+    HeapFree(GetProcessHeap(), 0, p);
+
+    if (SUCCEEDED(hr)) {
+        while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    CoUninitialize();
+    return 0;
+}
+
 static HRESULT STDMETHODCALLTYPE DO_GetData(IDataObject *this, FORMATETC *pformatetc,
                                             STGMEDIUM *pmedium)
 {
@@ -831,8 +1278,8 @@ static HRESULT STDMETHODCALLTYPE DO_GetData(IDataObject *this, FORMATETC *pforma
         fgd->cItems = (UINT)d->meta_count;
         for (i = 0; i < d->meta_count; i++) {
             FILEDESCRIPTORW *fd = &fgd->fgd[i];
-            fd->dwFlags = FD_ATTRIBUTES |
-                          (d->meta[i].is_dir ? 0 : (FD_FILESIZE | FD_PROGRESSUI));
+            fd->dwFlags = FD_ATTRIBUTES | FD_PROGRESSUI |
+                          (d->meta[i].is_dir ? 0 : FD_FILESIZE);
             fd->dwFileAttributes = d->meta[i].is_dir
                                        ? FILE_ATTRIBUTE_DIRECTORY
                                        : (d->meta[i].attrs & 0xFFFF);
@@ -848,8 +1295,55 @@ static HRESULT STDMETHODCALLTYPE DO_GetData(IDataObject *this, FORMATETC *pforma
 
     if (pformatetc->cfFormat == g_cf_file_contents && (pformatetc->tymed & TYMED_ISTREAM)) {
         FileContentsStream *s;
+        FcsCreateParams *p;
+        HANDLE th;
+        IStream *proxy = NULL;
+        HRESULT hr2 = E_FAIL;
+
         i = pformatetc->lindex;
         if (i < 0 || i >= d->meta_count) return DV_E_LINDEX;
+        clip_log("Shell asked for FileContents %d '%ls' (%llu bytes).",
+                 i, d->meta[i].name, (unsigned long long)d->meta[i].size);
+
+        p = (FcsCreateParams *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                         sizeof(*p));
+        if (!p) return E_OUTOFMEMORY;
+        p->index = i;
+        p->size = d->meta[i].size;
+        wcscpy_s(p->rel_name, MAX_PATH, d->meta[i].name);
+        p->ready = CreateEventW(NULL, FALSE, FALSE, NULL);
+        p->unmarshalled = CreateEventW(NULL, FALSE, FALSE, NULL);
+
+        if (p->ready && p->unmarshalled) {
+            th = CreateThread(NULL, 0, fcs_thread_proc, p, 0, NULL);
+            if (th) {
+                CloseHandle(th);
+                if (WaitForSingleObject(p->ready, 5000) == WAIT_OBJECT_0 &&
+                    SUCCEEDED(p->hr) && p->marshal) {
+                    hr2 = CoGetInterfaceAndReleaseStream(p->marshal, &IID_IStream,
+                                                         (void **)&proxy);
+                    SetEvent(p->unmarshalled);   /* worker owns p now */
+                    if (SUCCEEDED(hr2) && proxy) {
+                        pmedium->tymed = TYMED_ISTREAM;
+                        pmedium->pstm = proxy;
+                        return S_OK;
+                    }
+                } else {
+                    SetEvent(p->unmarshalled);   /* worker owns p now */
+                }
+                /* fall through to the direct-stream fallback */
+            } else {
+                CloseHandle(p->ready);
+                CloseHandle(p->unmarshalled);
+                HeapFree(GetProcessHeap(), 0, p);
+            }
+        } else {
+            if (p->ready) CloseHandle(p->ready);
+            if (p->unmarshalled) CloseHandle(p->unmarshalled);
+            HeapFree(GetProcessHeap(), 0, p);
+        }
+
+        /* Fallback (thread or marshal failed): create the stream on this STA. */
         s = (FileContentsStream *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                             sizeof(FileContentsStream));
         if (!s) return E_OUTOFMEMORY;
@@ -857,6 +1351,7 @@ static HRESULT STDMETHODCALLTYPE DO_GetData(IDataObject *this, FORMATETC *pforma
         s->ref = 1;
         s->index = i;
         s->declared_size = d->meta[i].size;
+        wcscpy_s(s->rel_name, MAX_PATH, d->meta[i].name);
         s->hFile = INVALID_HANDLE_VALUE;
         pmedium->tymed = TYMED_ISTREAM;
         pmedium->pstm = (IStream *)s;
@@ -1100,6 +1595,16 @@ static void clip_apply_format_list(void)
                 g_applied_has_nonfile = 1;
                 clip_log("Advertised %d file(s) via FileContents (lazy).",
                          g_file_meta_count);
+                {
+                    int li;
+                    for (li = 0; li < g_file_meta_count && li < 8; li++)
+                        clip_log("  [%d] '%ls' %llu bytes%s",
+                                 li, g_file_meta[li].name,
+                                 (unsigned long long)g_file_meta[li].size,
+                                 g_file_meta[li].is_dir ? " (dir)" : "");
+                    if (g_file_meta_count > 8)
+                        clip_log("  ... and %d more.", g_file_meta_count - 8);
+                }
                 clip_free_pending();
                 LeaveCriticalSection(&g_state_cs);
                 return;
@@ -1354,6 +1859,217 @@ static BOOL clip_recv_file_data(AsbConn *s, const ClipHeader *hdr)
     return TRUE;
 }
 
+/* Handle one message from the host.  Called from the recv loop, and also from
+   the on-demand file wait below: a FORMAT_LIST pushed by the host while we are
+   waiting for a FILE_DATA reply can appear in between and must not be parsed
+   as the reply.  Returns FALSE when the connection must be torn down. */
+static BOOL clip_handle_host_message(AsbConn *s, const ClipHeader *hdr)
+{
+    switch (hdr->msg_type) {
+
+    case CLIP_MSG_SYNC_ENABLE: {
+        UINT8 flag = 0;
+        if (hdr->data_size >= 1) {
+            if (!recv_exact(s, &flag, 1)) return FALSE;
+            if (hdr->data_size > 1) {
+                BYTE skip[256];
+                UINT32 rem = hdr->data_size - 1;
+                while (rem > 0) {
+                    int c = rem > 256 ? 256 : (int)rem;
+                    if (!recv_exact(s, skip, c)) return FALSE;
+                    rem -= c;
+                }
+            }
+        }
+        InterlockedExchange(&g_sync_enabled, flag ? 1 : 0);
+        if (flag && g_sync_event) SetEvent(g_sync_event);
+        else if (!flag && g_sync_event) ResetEvent(g_sync_event);
+        clip_log("SYNC_ENABLE %s", flag ? "ON" : "OFF");
+        return TRUE;
+    }
+
+    case CLIP_MSG_FORMAT_LIST: {
+        BYTE buf[16384];
+        UINT32 count, i;
+        int off;
+
+        if (hdr->data_size > sizeof(buf)) return FALSE;
+        if (hdr->data_size < 4) return FALSE;
+        if (!recv_exact(s, buf, (int)hdr->data_size)) return FALSE;
+
+        if (!g_sync_enabled) {
+            clip_log("FORMAT_LIST ignored (sync disabled).");
+            return TRUE;
+        }
+
+        count = *(UINT32 *)buf;
+        if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
+        off = 4;
+
+        /* A new list supersedes any in-flight file fetch. */
+        g_file_fetch_active = 0;
+
+        /* Serialize with apply/add-files on the window thread. */
+        EnterCriticalSection(&g_state_cs);
+        clip_free_pending();
+        g_clip_fmt_count = 0;
+        for (i = 0; i < count && off + 8 <= (int)hdr->data_size; i++) {
+            UINT32 fmt_id   = *(UINT32 *)(buf + off); off += 4;
+            UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
+            UINT local_id = fmt_id;
+
+            /* off is in [8, data_size] here; reject a name_len that runs
+               past the buffer (or whose signed cast would corrupt off)
+               before the unconditional `off += name_len` advance below. */
+            if (name_len > (UINT32)((int)hdr->data_size - off)) break;
+
+            if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr->data_size) {
+                char name[256];
+                memcpy(name, buf + off, name_len);
+                name[name_len] = '\0';
+                local_id = RegisterClipboardFormatA(name);
+                clip_log("Format '%s' remote=%u local=%u.", name, fmt_id, local_id);
+            }
+            off += (int)name_len;
+
+            g_clip_fmts[g_clip_fmt_count].local_id = local_id;
+            g_clip_fmts[g_clip_fmt_count].remote_id = fmt_id;
+            g_clip_fmts[g_clip_fmt_count].data = NULL;
+            g_clip_fmts[g_clip_fmt_count].data_size = 0;
+            /* CF_HDROP is the file list: fetched in the background after apply. */
+            g_clip_fmts[g_clip_fmt_count].is_hdrop =
+                (local_id == CF_HDROP) ? TRUE : FALSE;
+            g_clip_fmt_count++;
+        }
+        /* A new list always starts with no file metadata: the host sends
+           it as a separate FILE_LIST right after this message. */
+        g_file_meta_count = 0;
+        g_list_has_hdrop = 0;
+        for (i = 0; i < (UINT32)g_clip_fmt_count; i++) {
+            if (g_clip_fmts[i].is_hdrop) { g_list_has_hdrop = 1; break; }
+        }
+        /* Old hosts never send FILE_LIST; do not wait for them forever. */
+        g_meta_deadline = GetTickCount64() + 1000;
+
+        g_list_gen++;
+        g_clip_fetch_idx = 0;
+        LeaveCriticalSection(&g_state_cs);
+
+        clip_log("Received format list (%u formats); fetching non-file formats...",
+                 g_clip_fmt_count);
+
+        /* Temp files are cleaned when the list is applied (or when a
+           render starts), never here: a lazy list must not delete the
+           files a pending paste might still need. */
+
+        /* Fetch the small formats; CF_HDROP entries are skipped. */
+        clip_request_next_format();
+        return TRUE;
+    }
+
+    case CLIP_MSG_FORMAT_DATA_RESP: {
+        int idx = g_clip_fetch_idx;
+
+        /* Completion of the background file fetch: the host streams
+           FILE_DATA messages and terminates with an empty FORMAT_DATA_RESP
+           for CF_HDROP. Wake the window thread to add the files. */
+        if (hdr->format == CF_HDROP && g_file_fetch_active) {
+            clip_log("Data response for background file fetch (format %u, %u bytes).",
+                     hdr->format, hdr->data_size);
+            if (hdr->data_size > 0) {
+                BYTE skip[4096];
+                UINT32 rem = hdr->data_size;
+                while (rem > 0) {
+                    int c = rem > 4096 ? 4096 : (int)rem;
+                    if (!recv_exact(s, skip, c)) return FALSE;
+                    rem -= c;
+                }
+            }
+            if (g_msg_hwnd)
+                PostMessageW(g_msg_hwnd, WM_CLIP_ADD_FILES, 0, 0);
+            clip_log("File fetch complete.");
+            return TRUE;
+        }
+
+        clip_log("Data response for format %u (%u bytes).", hdr->format, hdr->data_size);
+
+        if (idx >= 0 && idx < g_clip_fmt_count) {
+            if (hdr->data_size > 0 && hdr->data_size <= CLIP_MAX_PAYLOAD) {
+                BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
+                if (data && recv_exact(s, data, (int)hdr->data_size)) {
+                    g_clip_fmts[idx].data = data;
+                    g_clip_fmts[idx].data_size = hdr->data_size;
+                } else {
+                    if (data) HeapFree(GetProcessHeap(), 0, data);
+                }
+            }
+            g_clip_fetch_idx++;
+            clip_request_next_format();
+        }
+        return TRUE;
+    }
+
+    case CLIP_MSG_FILE_DATA:
+        CreateDirectoryW(g_clip_temp_dir, NULL);
+        return clip_recv_file_data(s, hdr);
+
+    case CLIP_MSG_FILE_LIST: {
+        /* File metadata for FileContents. Parse into g_file_meta. */
+        BYTE *buf = NULL;
+        UINT32 count, i, off = 0;
+        if (hdr->data_size < 4) return TRUE;
+        buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
+        if (!buf) return TRUE;
+        if (!recv_exact(s, buf, (int)hdr->data_size)) { HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
+        count = *(UINT32 *)buf; off = 4;
+        if (count > META_MAX) count = META_MAX;
+        EnterCriticalSection(&g_state_cs);
+        g_file_meta_count = 0;
+        for (i = 0; i < count && off + 4 <= (int)hdr->data_size; i++) {
+            UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
+            if (name_len > (MAX_PATH - 1) * sizeof(wchar_t) || off + (int)name_len + 8 + 4 + 1 > (int)hdr->data_size) break;
+            if (name_len > 0) {
+                memcpy(g_file_meta[g_file_meta_count].name, buf + off, name_len);
+                g_file_meta[g_file_meta_count].name[name_len / sizeof(wchar_t)] = L'\0';
+            } else {
+                g_file_meta[g_file_meta_count].name[0] = L'\0';
+            }
+            off += name_len;
+            g_file_meta[g_file_meta_count].size = *(UINT64 *)(buf + off); off += 8;
+            g_file_meta[g_file_meta_count].attrs = *(UINT32 *)(buf + off); off += 4;
+            g_file_meta[g_file_meta_count].is_dir = buf[off++] ? 1 : 0;
+            g_file_meta_count++;
+        }
+        LeaveCriticalSection(&g_state_cs);
+        HeapFree(GetProcessHeap(), 0, buf);
+        clip_log("Received file metadata (%d entries).", g_file_meta_count);
+        return TRUE;
+    }
+
+    case CLIP_MSG_FILE_DATA_REQ: {
+        /* Guest sends FILE_DATA_REQ; nothing to do when receiving one. */
+        if (hdr->data_size > 0) {
+            BYTE skip[256]; UINT32 rem = hdr->data_size;
+            while (rem > 0) { int c = rem > 256 ? 256 : (int)rem; if (!recv_exact(s, skip, c)) return FALSE; rem -= c; }
+        }
+        return TRUE;
+    }
+
+    default:
+        clip_log("Unknown msg_type %u.", hdr->msg_type);
+        if (hdr->data_size > 0) {
+            BYTE skip[256];
+            UINT32 remaining = hdr->data_size;
+            while (remaining > 0) {
+                int chunk = remaining > 256 ? 256 : (int)remaining;
+                if (!recv_exact(s, skip, chunk)) return FALSE;
+                remaining -= chunk;
+            }
+        }
+        return TRUE;
+    }
+}
+
 /* ---- Recv thread: delayed rendering protocol ---- */
 
 static DWORD WINAPI recv_thread_proc(LPVOID param)
@@ -1374,20 +2090,36 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
         }
 
         /* Serve a pending on-demand file request (FileContents paste).
-           The bytes are written to a temp file as they arrive; the waiting
-           IStream drains it, so the shell's progress dialog advances. */
-        if (g_file_req_pending) {
+           The bytes are written into the staging file the requesting IStream
+           created; that stream drains it, so the shell's progress dialog
+           advances during the transfer. */
+        if (InterlockedCompareExchange(&g_file_req_pending, 1, 1)) {
             ClipHeader rhdr;
             ClipHeader r;
             ClipFileInfo fi;
-            UINT32 idx = (UINT32)g_file_req_idx;
+            UINT32 idx;
+            wchar_t expect_name[MAX_PATH];
+            UINT64 expect_size;
             BOOL ok = TRUE;
+            HANDLE hf = INVALID_HANDLE_VALUE;
+            BOOL discarding = FALSE;
 
+            ZeroMemory(&r, sizeof(r));
+            ZeroMemory(&fi, sizeof(fi));
+
+            /* Take this request out of the shared slot.  Clear pending while
+               holding the lock: a stream can only claim the (still busy) slot
+               after we free it below, so it cannot be erased by this clear. */
             EnterCriticalSection(&g_xfer_cs);
-            g_xfer_written = 0;
-            g_xfer_done    = 0;
-            g_xfer_error   = 0;
-            g_xfer_path[0] = L'\0';
+            idx         = (UINT32)g_file_req_idx;
+            expect_size = g_xfer_total;
+            wcscpy_s(expect_name, MAX_PATH, g_req_name);
+            /* Own handle to the staging file, duplicated by the stream.  Do not
+               reopen g_xfer_path: an early Release deletes it while our reply
+               is already in flight. */
+            hf = g_xfer_hFile;
+            g_xfer_hFile = NULL;
+            InterlockedExchange(&g_file_req_pending, 0);
             LeaveCriticalSection(&g_xfer_cs);
 
             rhdr.magic = CLIP_MAGIC;
@@ -1400,89 +2132,154 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
                 ok = FALSE;
             LeaveCriticalSection(&g_send_cs);
 
-            if (ok && recv_exact(s, &r, sizeof(r)) && r.magic == CLIP_MAGIC) {
-                if (recv_exact(s, &fi, sizeof(fi))) {
-                    wchar_t rel[MAX_PATH];
-                    rel[0] = L'\0';
-                    if (fi.path_len > 0 &&
-                        fi.path_len <= (MAX_PATH - 1) * sizeof(wchar_t)) {
-                        if (recv_exact(s, rel, (int)fi.path_len))
-                            rel[fi.path_len / sizeof(wchar_t)] = L'\0';
-                        else
-                            ok = FALSE;
-                    } else if (fi.path_len > 0) {
-                        BYTE skip[4096];
-                        UINT32 rem = fi.path_len;
-                        while (ok && rem > 0) {
-                            int c = rem > 4096 ? 4096 : (int)rem;
-                            if (!recv_exact(s, skip, c)) ok = FALSE;
-                            rem -= c;
-                        }
+            if (ok)
+                clip_log("Lazy request %u: serving '%ls' (%llu bytes).",
+                         idx, expect_name, (unsigned long long)expect_size);
+
+            /* Wait for our reply, folding any genuine host push (FORMAT_LIST /
+               FILE_LIST) that was sent while the request was outstanding.  A
+               new host tags the reply with idx+1 so an eager file stream is
+               never mistaken for the pasted file. */
+            if (ok) {
+                for (;;) {
+                    if (!recv_exact(s, &r, sizeof(r)) || r.magic != CLIP_MAGIC) {
+                        ok = FALSE;
+                        break;
                     }
-
-                    if (ok) {
-                        wchar_t tmp[MAX_PATH];
-                        HANDLE hf;
-
-                        CreateDirectoryW(g_clip_temp_dir, NULL);
-                        swprintf_s(tmp, MAX_PATH, L"%s\\_fc_%d.tmp",
-                                   g_clip_temp_dir, (int)idx);
-                        hf = CreateFileW(tmp, GENERIC_WRITE,
-                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                         NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                        if (hf != INVALID_HANDLE_VALUE) {
-                            BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
-                            UINT64 remaining = fi.file_size;
-
-                            EnterCriticalSection(&g_xfer_cs);
-                            wcscpy_s(g_xfer_path, MAX_PATH, tmp);
-                            g_xfer_total = fi.file_size;
-                            LeaveCriticalSection(&g_xfer_cs);
-                            SetEvent(g_xfer_start);   /* reader may open it now */
-
-                            while (ok && remaining > 0) {
-                                DWORD to_read = remaining > CLIP_FILE_CHUNK
-                                                    ? CLIP_FILE_CHUNK
-                                                    : (DWORD)remaining;
-                                DWORD written = 0;
-
-                                if (!chunk || !recv_exact(s, chunk, (int)to_read)) {
-                                    ok = FALSE;
-                                    break;
-                                }
-                                if (!WriteFile(hf, chunk, to_read, &written, NULL) ||
-                                    written != to_read) {
-                                    ok = FALSE;
-                                    break;
-                                }
-                                EnterCriticalSection(&g_xfer_cs);
-                                g_xfer_written += written;
-                                LeaveCriticalSection(&g_xfer_cs);
-                                SetEvent(g_xfer_event);
-                                remaining -= to_read;
-                            }
-
-                            if (chunk) HeapFree(GetProcessHeap(), 0, chunk);
-                            CloseHandle(hf);
-                        } else {
-                            ok = FALSE;
-                        }
+                    if (r.msg_type == CLIP_MSG_FILE_DATA && r.format == idx + 1)
+                        break;
+                    if (!clip_handle_host_message(s, &r)) {
+                        ok = FALSE;
+                        break;
                     }
-                } else {
-                    ok = FALSE;
                 }
-            } else {
-                ok = FALSE;
             }
 
-            EnterCriticalSection(&g_xfer_cs);
-            if (!ok) g_xfer_error = 1;
-            g_xfer_done   = 1;
-            g_xfer_active = 0;
-            LeaveCriticalSection(&g_xfer_cs);
-            SetEvent(g_xfer_start);   /* wake a reader that never got a file */
-            SetEvent(g_xfer_event);
-            InterlockedExchange(&g_file_req_pending, 0);
+            if (ok &&
+                (r.data_size < sizeof(fi) || !recv_exact(s, &fi, sizeof(fi))))
+                ok = FALSE;
+
+            if (ok) {
+                wchar_t rel[MAX_PATH];
+                BOOL named = FALSE;
+
+                rel[0] = L'\0';
+                if (fi.path_len > 0 &&
+                    fi.path_len <= (MAX_PATH - 1) * sizeof(wchar_t)) {
+                    if (recv_exact(s, rel, (int)fi.path_len)) {
+                        rel[fi.path_len / sizeof(wchar_t)] = L'\0';
+                        named = TRUE;
+                    } else {
+                        ok = FALSE;
+                    }
+                } else if (fi.path_len > 0) {
+                    ok = FALSE;   /* bogus length: never drain a huge body */
+                }
+
+                if (ok && (!named || wcscmp(rel, expect_name) != 0 ||
+                           (!fi.is_directory && fi.file_size != expect_size))) {
+                    clip_log("File reply does not match request %u (want '%ls', "
+                             "%llu bytes; got '%ls', %llu%s); aborting.",
+                             idx, expect_name,
+                             (unsigned long long)expect_size,
+                             named ? rel : L"", (unsigned long long)fi.file_size,
+                             fi.is_directory ? L", directory" : L"");
+                    ok = FALSE;
+                }
+            }
+
+            if (ok) {
+                if (hf == NULL || hf == INVALID_HANDLE_VALUE) {
+                    clip_log("Request %u has no staging handle "
+                             "(stream released); failing request.", idx);
+                    ok = FALSE;
+                } else {
+                    BYTE *chunk = NULL;
+                    UINT64 remaining = fi.is_directory ? 0 : fi.file_size;
+
+                    /* Released before the first byte arrived: discard the whole
+                       body instead of writing a file nobody will ever read. */
+                    if (InterlockedCompareExchange(&g_xfer_cancel, 1, 1)) {
+                        discarding = TRUE;
+                        clip_log("Lazy request %u abandoned before the body; "
+                                 "discarding %llu bytes.",
+                                 idx, (unsigned long long)remaining);
+                        CloseHandle(hf);
+                        hf = INVALID_HANDLE_VALUE;
+                    }
+
+                    if (hf != NULL && hf != INVALID_HANDLE_VALUE)
+                        SetFilePointer(hf, 0, NULL, FILE_BEGIN);
+                    if (remaining > 0)
+                        chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
+                    while (ok && remaining > 0) {
+                        DWORD to_read = remaining > CLIP_FILE_CHUNK
+                                            ? CLIP_FILE_CHUNK
+                                            : (DWORD)remaining;
+                        DWORD written = 0;
+
+                        if (!chunk || !recv_exact(s, chunk, (int)to_read)) {
+                            clip_log("Lazy request %u: receive failed after %llu "
+                                     "of %llu bytes.",
+                                     idx,
+                                     (unsigned long long)(fi.file_size - remaining),
+                                     (unsigned long long)fi.file_size);
+                            ok = FALSE;
+                            break;
+                        }
+
+                        /* The paste was abandoned: keep draining the body so the
+                           wire stays in sync, but stop writing and keep the
+                           connection up for the other pastes. */
+                        if (!discarding &&
+                            InterlockedCompareExchange(&g_xfer_cancel, 1, 1)) {
+                            discarding = TRUE;
+                            clip_log("Lazy request %u abandoned by the paste; "
+                                     "discarding the remaining %llu bytes.",
+                                     idx, (unsigned long long)remaining);
+                            if (hf != NULL && hf != INVALID_HANDLE_VALUE) {
+                                CloseHandle(hf);
+                                hf = INVALID_HANDLE_VALUE;
+                            }
+                        }
+
+                        if (!discarding &&
+                            (!WriteFile(hf, chunk, to_read, &written, NULL) ||
+                             written != to_read)) {
+                            clip_log("Lazy request %u: staging write failed after "
+                                     "%llu of %llu bytes (error %lu).",
+                                     idx,
+                                     (unsigned long long)(fi.file_size - remaining),
+                                     (unsigned long long)fi.file_size,
+                                     GetLastError());
+                            ok = FALSE;
+                            break;
+                        }
+                        remaining -= to_read;
+                        if (!discarding) fcs_signal_data();
+                    }
+                    if (chunk) HeapFree(GetProcessHeap(), 0, chunk);
+                }
+            }
+
+            if (hf != NULL && hf != INVALID_HANDLE_VALUE) {
+                CloseHandle(hf);
+                hf = INVALID_HANDLE_VALUE;
+            }
+
+            /* A broken connection (socket error, validation failure) must tear
+               down this session so the host stops sending the old body and the
+               next paste starts immediately. */
+            if (!ok) goto done;
+
+            /* Publish completion, then free the slot.  Clearing pending while
+               still holding the lock means a stream that claims the slot on
+               the wake-up cannot have its fresh request erased. */
+            clip_log("Lazy request %u %s (%llu bytes).", idx,
+                     discarding ? "drained after cancel" : "complete",
+                     (unsigned long long)expect_size);
+            InterlockedExchange(&g_xfer_cancel, 0);
+            fcs_finish_transfer(0);
             continue;
         }
 
@@ -1502,211 +2299,8 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
             break;
         }
 
-        switch (hdr.msg_type) {
-
-        case CLIP_MSG_SYNC_ENABLE: {
-            UINT8 flag = 0;
-            if (hdr.data_size >= 1) {
-                if (!recv_exact(s, &flag, 1)) goto done;
-                if (hdr.data_size > 1) {
-                    BYTE skip[256];
-                    UINT32 rem = hdr.data_size - 1;
-                    while (rem > 0) {
-                        int c = rem > 256 ? 256 : (int)rem;
-                        if (!recv_exact(s, skip, c)) goto done;
-                        rem -= c;
-                    }
-                }
-            }
-            InterlockedExchange(&g_sync_enabled, flag ? 1 : 0);
-            if (flag && g_sync_event) SetEvent(g_sync_event);
-            else if (!flag && g_sync_event) ResetEvent(g_sync_event);
-            clip_log("SYNC_ENABLE %s", flag ? "ON" : "OFF");
+        if (!clip_handle_host_message(s, &hdr))
             break;
-        }
-
-        case CLIP_MSG_FORMAT_LIST: {
-            BYTE buf[16384];
-            UINT32 count, i;
-            int off;
-
-            if (hdr.data_size > sizeof(buf)) goto done;
-            if (hdr.data_size < 4) goto done;
-            if (!recv_exact(s, buf, (int)hdr.data_size)) goto done;
-
-            if (!g_sync_enabled) {
-                clip_log("FORMAT_LIST ignored (sync disabled).");
-                break;
-            }
-
-            count = *(UINT32 *)buf;
-            if (count > CLIP_MAX_FORMATS) count = CLIP_MAX_FORMATS;
-            off = 4;
-
-            /* A new list supersedes any in-flight file fetch. */
-            g_file_fetch_active = 0;
-
-            /* Serialize with apply/add-files on the window thread. */
-            EnterCriticalSection(&g_state_cs);
-            clip_free_pending();
-            g_clip_fmt_count = 0;
-            for (i = 0; i < count && off + 8 <= (int)hdr.data_size; i++) {
-                UINT32 fmt_id   = *(UINT32 *)(buf + off); off += 4;
-                UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
-                UINT local_id = fmt_id;
-
-                /* off is in [8, data_size] here; reject a name_len that runs
-                   past the buffer (or whose signed cast would corrupt off)
-                   before the unconditional `off += name_len` advance below. */
-                if (name_len > (UINT32)((int)hdr.data_size - off)) break;
-
-                if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr.data_size) {
-                    char name[256];
-                    memcpy(name, buf + off, name_len);
-                    name[name_len] = '\0';
-                    local_id = RegisterClipboardFormatA(name);
-                    clip_log("Format '%s' remote=%u local=%u.", name, fmt_id, local_id);
-                }
-                off += (int)name_len;
-
-                g_clip_fmts[g_clip_fmt_count].local_id = local_id;
-                g_clip_fmts[g_clip_fmt_count].remote_id = fmt_id;
-                g_clip_fmts[g_clip_fmt_count].data = NULL;
-                g_clip_fmts[g_clip_fmt_count].data_size = 0;
-                /* CF_HDROP is the file list: fetched in the background after apply. */
-                g_clip_fmts[g_clip_fmt_count].is_hdrop =
-                    (local_id == CF_HDROP) ? TRUE : FALSE;
-                g_clip_fmt_count++;
-            }
-            /* A new list always starts with no file metadata: the host sends
-               it as a separate FILE_LIST right after this message. */
-            g_file_meta_count = 0;
-            g_list_has_hdrop = 0;
-            for (i = 0; i < (UINT32)g_clip_fmt_count; i++) {
-                if (g_clip_fmts[i].is_hdrop) { g_list_has_hdrop = 1; break; }
-            }
-            /* Old hosts never send FILE_LIST; do not wait for them forever. */
-            g_meta_deadline = GetTickCount64() + 1000;
-
-            g_list_gen++;
-            g_clip_fetch_idx = 0;
-            LeaveCriticalSection(&g_state_cs);
-
-            clip_log("Received format list (%u formats); fetching non-file formats...",
-                     g_clip_fmt_count);
-
-            /* Temp files are cleaned when the list is applied (or when a
-               render starts), never here: a lazy list must not delete the
-               files a pending paste might still need. */
-
-            /* Fetch the small formats; CF_HDROP entries are skipped. */
-            clip_request_next_format();
-            break;
-        }
-
-        case CLIP_MSG_FORMAT_DATA_RESP: {
-            int idx = g_clip_fetch_idx;
-
-            /* Completion of the background file fetch: the host streams
-               FILE_DATA messages and terminates with an empty FORMAT_DATA_RESP
-               for CF_HDROP. Wake the window thread to add the files. */
-            if (hdr.format == CF_HDROP && g_file_fetch_active) {
-                clip_log("Data response for background file fetch (format %u, %u bytes).",
-                         hdr.format, hdr.data_size);
-                if (hdr.data_size > 0) {
-                    BYTE skip[4096];
-                    UINT32 rem = hdr.data_size;
-                    while (rem > 0) {
-                        int c = rem > 4096 ? 4096 : (int)rem;
-                        if (!recv_exact(s, skip, c)) goto done;
-                        rem -= c;
-                    }
-                }
-                if (g_msg_hwnd)
-                    PostMessageW(g_msg_hwnd, WM_CLIP_ADD_FILES, 0, 0);
-                clip_log("File fetch complete.");
-                break;
-            }
-
-            clip_log("Data response for format %u (%u bytes).", hdr.format, hdr.data_size);
-
-            if (idx >= 0 && idx < g_clip_fmt_count) {
-                if (hdr.data_size > 0 && hdr.data_size <= CLIP_MAX_PAYLOAD) {
-                    BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr.data_size);
-                    if (data && recv_exact(s, data, (int)hdr.data_size)) {
-                        g_clip_fmts[idx].data = data;
-                        g_clip_fmts[idx].data_size = hdr.data_size;
-                    } else {
-                        if (data) HeapFree(GetProcessHeap(), 0, data);
-                    }
-                }
-                g_clip_fetch_idx++;
-                clip_request_next_format();
-            }
-            break;
-        }
-
-        case CLIP_MSG_FILE_DATA:
-            CreateDirectoryW(g_clip_temp_dir, NULL);
-            if (!clip_recv_file_data(s, &hdr)) goto done;
-            break;
-
-        case CLIP_MSG_FILE_LIST: {
-            /* File metadata for FileContents. Parse into g_file_meta. */
-            BYTE *buf = NULL;
-            UINT32 count, i, off = 0;
-            if (hdr.data_size < 4) break;
-            buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr.data_size);
-            if (!buf) break;
-            if (!recv_exact(s, buf, (int)hdr.data_size)) { HeapFree(GetProcessHeap(), 0, buf); goto done; }
-            count = *(UINT32 *)buf; off = 4;
-            if (count > META_MAX) count = META_MAX;
-            EnterCriticalSection(&g_state_cs);
-            g_file_meta_count = 0;
-            for (i = 0; i < count && off + 4 <= (int)hdr.data_size; i++) {
-                UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
-                if (name_len > (MAX_PATH - 1) * sizeof(wchar_t) || off + (int)name_len + 8 + 4 + 1 > (int)hdr.data_size) break;
-                if (name_len > 0) {
-                    memcpy(g_file_meta[g_file_meta_count].name, buf + off, name_len);
-                    g_file_meta[g_file_meta_count].name[name_len / sizeof(wchar_t)] = L'\0';
-                } else {
-                    g_file_meta[g_file_meta_count].name[0] = L'\0';
-                }
-                off += name_len;
-                g_file_meta[g_file_meta_count].size = *(UINT64 *)(buf + off); off += 8;
-                g_file_meta[g_file_meta_count].attrs = *(UINT32 *)(buf + off); off += 4;
-                g_file_meta[g_file_meta_count].is_dir = buf[off++] ? 1 : 0;
-                g_file_meta_count++;
-            }
-            LeaveCriticalSection(&g_state_cs);
-            HeapFree(GetProcessHeap(), 0, buf);
-            clip_log("Received file metadata (%d entries).", g_file_meta_count);
-            break;
-        }
-
-        case CLIP_MSG_FILE_DATA_REQ: {
-            /* Host? No, this case is guest receiving. Guest doesn't receive this. */
-            /* Actually guest sends FILE_DATA_REQ; nothing to do here. */
-            if (hdr.data_size > 0) {
-                BYTE skip[256]; UINT32 rem = hdr.data_size;
-                while (rem > 0) { int c = rem > 256 ? 256 : (int)rem; if (!recv_exact(s, skip, c)) goto done; rem -= c; }
-            }
-            break;
-        }
-
-        default:
-            clip_log("Unknown msg_type %u.", hdr.msg_type);
-            if (hdr.data_size > 0) {
-                BYTE skip[256];
-                UINT32 remaining = hdr.data_size;
-                while (remaining > 0) {
-                    int chunk = remaining > 256 ? 256 : (int)remaining;
-                    if (!recv_exact(s, skip, chunk)) goto done;
-                    remaining -= chunk;
-                }
-            }
-            break;
-        }
     }
 
 done:
@@ -1721,14 +2315,27 @@ done:
     g_file_fetch_active = 0;
     InterlockedExchange(&g_apply_pending, 0);
 
-    /* Unblock a paste that is waiting for bytes we can no longer deliver. */
+    /* Unblock a paste that is waiting for bytes we can no longer deliver.
+       Mark the channel dead first so streams queued behind the slot fail
+       immediately instead of waiting for a request nobody will serve. */
+    {
+        int had_active;
+
+        EnterCriticalSection(&g_xfer_cs);
+        had_active = g_xfer_active;
+        LeaveCriticalSection(&g_xfer_cs);
+
+        InterlockedExchange(&g_xfer_dead, 1);
+        fcs_finish_transfer(1);
+        clip_log("Connection lost (%s); cancelling in-flight transfer.",
+                 had_active ? "transfer active" : "no transfer active");
+    }
     EnterCriticalSection(&g_xfer_cs);
-    if (g_xfer_active) g_xfer_error = 1;
-    g_xfer_done   = 1;
-    g_xfer_active = 0;
+    if (g_xfer_hFile && g_xfer_hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_xfer_hFile);
+        g_xfer_hFile = NULL;
+    }
     LeaveCriticalSection(&g_xfer_cs);
-    SetEvent(g_xfer_start);
-    SetEvent(g_xfer_event);
 
     clip_log("Recv thread exiting.");
     return 0;
@@ -1749,6 +2356,7 @@ static void handle_client(AsbConn *s)
     clip_log("Sent ready signal to host.");
 
     g_client_sock = s;
+    InterlockedExchange(&g_xfer_dead, 0);
 
     /* Start recv thread */
     recv_th = CreateThread(NULL, 0, recv_thread_proc, (LPVOID)s, 0, NULL);
@@ -1784,20 +2392,25 @@ int main(void)
     HANDLE msg_th;
     AsbListener *l;
 
-    clip_log("Starting (PID=%lu, session=%lu).",
+    clip_log("Starting (PID=%lu, session=%lu). Log: %s",
              GetCurrentProcessId(),
-             WTSGetActiveConsoleSessionId());
+             WTSGetActiveConsoleSessionId(),
+             clip_log_path());
 
     InitializeCriticalSection(&g_send_cs);
     InitializeCriticalSection(&g_state_cs);
     InitializeCriticalSection(&g_xfer_cs);
-    g_xfer_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    g_xfer_start = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_slot_event = CreateEventW(NULL, TRUE, TRUE, NULL);
     g_clip_fetch_idx = 0;
     g_list_gen = 0;
     g_file_fetch_active = 0;
 
     clip_init_temp_dir();
+
+    /* Stale staging files from a previous run: nothing can still be reading
+       them, and they are never touched by the per-list temp cleanup. */
+    clip_remove_dir_recursive(g_lazy_dir);
+    CreateDirectoryW(g_lazy_dir, NULL);
 
     g_cf_file_desc = RegisterClipboardFormatW(L"FileGroupDescriptorW");
     g_cf_file_contents = RegisterClipboardFormatW(L"FileContents");
