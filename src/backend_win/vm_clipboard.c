@@ -59,6 +59,7 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 #define CLIP_MSG_FILE_DATA        4
 #define CLIP_MSG_FILE_LIST        5   /* host -> guest: file metadata for FileContents */
 #define CLIP_MSG_FILE_DATA_REQ    6   /* guest -> host: request one file's bytes */
+#define CLIP_MSG_PULL_LIST        7   /* host -> guest: re-send the current format list */
 /* CLIP_MSG_SYNC_ENABLE = 12 (defined in header) */
 
 /* Appended to FORMAT_LIST by a guest that will follow it with CLIP_MSG_FILE_LIST
@@ -86,6 +87,11 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
    a request.  Receiving it is a local guest operation; two minutes means the
    guest (or the link) is wedged and the connection should be rebuilt. */
 #define CLIP_REPLY_WAIT_MS  120000
+/* How long the "accept the next guest list even while unfocused" token stays
+   valid after the host asked the guest for a fresh list.  A new guest answers
+   at once; an old one ignores message type 7, and the token must not outlive
+   that reply or the focus gate would stay bypassed for the whole connection. */
+#define CLIP_PULL_WAIT_MS   10000
 #define SMALL_MAX           64
 
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
@@ -243,6 +249,15 @@ struct VmClipboardData {
     BOOL             reader_formats_done;
     ULONGLONG        reader_meta_deadline;   /* 0 = not waiting */
     volatile LONG    reader_want_eager;      /* OLE failed: fetch files eagerly */
+
+    /* The advertised guest list no longer matches what the guest holds (a
+       stale request was refused).  After the channel reconnects the host asks
+       the guest to send its current list; otherwise every retry would keep
+       failing against the old names/sizes until the user copied again. */
+    volatile LONG    reader_pull_needed;
+    volatile LONG    reader_pull_sent;       /* accept the next list even if
+                                                sync is off (host asked for it) */
+    ULONGLONG        reader_pull_deadline;   /* 0 = no request outstanding */
 
     /* OLE STA worker: owns the guest->host data object.  The IDD display
        thread is MTA, and OleSetClipboard() only works on an STA. */
@@ -2748,6 +2763,10 @@ static BOOL clip_reader_serve_file_request(VmClipboard clip, SOCKET s)
                      idx, expect_name, (unsigned long long)expect_size,
                      named ? rel : L"", (unsigned long long)fi.file_size,
                      fi.is_directory ? L", directory" : L"");
+            /* The guest has copied something else since this list was
+               advertised.  Refresh it after the reconnect so the next paste
+               does not fail the same way. */
+            InterlockedExchange(&clip->reader_pull_needed, 1);
             ok = FALSE;
         }
     }
@@ -2860,6 +2879,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         BYTE *buf;
         UINT32 count, i;
         int off;
+        BOOL pulled;
 
         /* Need at least the 4-byte leading count; reject short frames so the
            `*(UINT32 *)buf` read below cannot over-read the allocation. */
@@ -2874,15 +2894,29 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
            applying it would publish files the focus gate said to ignore. */
         clip->reader_list_accepted = FALSE;
 
+        /* The host asked for this list after a stale request was refused.  It
+           must be honoured even if the window is unfocused (the paste that
+           failed may have been into Explorer, which leaves sync off) and it
+           takes precedence over a pending echo token.  The token expires so an
+           old guest (which ignores the request) cannot keep the focus gate
+           bypassed for the rest of the connection. */
+        pulled = (InterlockedCompareExchange(&clip->reader_pull_sent, 0, 0) != 0 &&
+                  GetTickCount64() < clip->reader_pull_deadline);
+        if (pulled) {
+            InterlockedExchange(&clip->reader_pull_sent, 0);
+            InterlockedExchange(&clip->reader_suppress, 0);
+            clip_log(clip, L"CLIP-R: Accepting the requested clipboard list.");
+        }
+
         /* Echo suppression */
-        if (InterlockedExchange(&clip->reader_suppress, 0)) {
+        if (!pulled && InterlockedExchange(&clip->reader_suppress, 0)) {
             clip_log(clip, L"CLIP-R: FORMAT_LIST suppressed (echo from host->guest).");
             HeapFree(GetProcessHeap(), 0, buf);
             return TRUE;
         }
 
         /* Focus gate: discard if sync is off */
-        if (!clip->sync_enabled) {
+        if (!pulled && !clip->sync_enabled) {
             clip_log(clip, L"CLIP-R: FORMAT_LIST discarded (sync disabled).");
             HeapFree(GetProcessHeap(), 0, buf);
             return TRUE;
@@ -3083,6 +3117,29 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
 
 /* ---- Reader recv thread ---- */
 
+/* Ask the guest to send its current clipboard list.  Used after a stale
+   request was refused: the host's advertisement no longer matches the guest,
+   and the guest will not send a new list on its own while sync is off.  An
+   old guest logs "Unknown msg_type 7" and skips the frame, so the connection
+   stays usable. */
+static void clip_reader_request_list(VmClipboard clip, SOCKET s)
+{
+    ClipHeader hdr;
+
+    hdr.magic = CLIP_MAGIC;
+    hdr.msg_type = CLIP_MSG_PULL_LIST;
+    hdr.format = 0;
+    hdr.data_size = 0;
+
+    InterlockedExchange(&clip->reader_pull_sent, 1);
+    clip->reader_pull_deadline = GetTickCount64() + CLIP_PULL_WAIT_MS;
+    EnterCriticalSection(&clip->reader_cs);
+    clip_send_all(s, &hdr, sizeof(hdr));
+    LeaveCriticalSection(&clip->reader_cs);
+    clip_log(clip, L"CLIP-R: Asked the guest to re-send its clipboard list "
+                   L"(stale advertisement).");
+}
+
 static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
 {
     VmClipboard clip = (VmClipboard)param;
@@ -3119,6 +3176,12 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
         if (clip->stop) break;
 
         s = clip->reader_socket;
+
+        /* The previous connection was dropped by a refused (stale) request:
+           ask the guest for its current list before serving anything else. */
+        if (InterlockedExchange(&clip->reader_pull_needed, 0))
+            clip_reader_request_list(clip, s);
+
         while (!clip->stop) {
             int r;
 
@@ -3159,6 +3222,8 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
         }
 
         InterlockedExchange(&clip->reader_link_up, 0);
+        InterlockedExchange(&clip->reader_pull_sent, 0);
+        clip->reader_pull_deadline = 0;
         clip_reader_free_pending(clip);
         /* The reader thread is gone (or about to reconnect): no one can serve
            an outstanding request.  Close the duplicated staging handle and
@@ -3229,6 +3294,9 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->pushed_seq = 0;
     clip->pushed_seq_valid = 0;
     clip->pushed_path_count = 0;
+    clip->reader_pull_needed = 0;
+    clip->reader_pull_sent = 0;
+    clip->reader_pull_deadline = 0;
 
     InitializeCriticalSection(&clip->writer_cs);
     InitializeCriticalSection(&clip->reader_cs);
