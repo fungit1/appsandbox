@@ -58,6 +58,7 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 #define CLIP_MSG_FILE_DATA        4
 #define CLIP_MSG_FILE_LIST        5   /* guest -> host: file metadata for lazy files */
 #define CLIP_MSG_FILE_DATA_REQ    6   /* host -> guest: request one file's bytes */
+#define CLIP_MSG_PULL_LIST        7   /* host -> guest: re-send the current list */
 
 /* Appended after the FORMAT_LIST entries when the guest will follow up with
    CLIP_MSG_FILE_LIST and wants files rendered lazily (on paste).  Old hosts
@@ -807,7 +808,6 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
                     remaining -= chunk;
                 }
             }
-            reader_log("File data request for index %u.", idx);
             clip_serve_file_request(idx);
             break;
         }

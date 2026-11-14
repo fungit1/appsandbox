@@ -486,7 +486,6 @@ typedef struct FileContentsStream {
     int started;
     int finished;
     int abandoned;                /* paste released this stream (under g_xfer_cs) */
-    int seek_logs;                /* bound Seek diagnostics */
     DWORD thread_id;              /* STA thread that services this stream */
     HANDLE data_event;            /* auto-reset: bytes arrived or transfer done */
 } FileContentsStream;
@@ -695,11 +694,16 @@ static BOOL fcs_start_request(FileContentsStream *s)
 
     CreateDirectoryW(g_lazy_dir, NULL);
     {
+        /* Only worth a line when the paste may actually run out of space;
+           otherwise this repeats once per file of a multi-file paste. */
         ULARGE_INTEGER freeb;
-        if (GetDiskFreeSpaceExW(g_lazy_dir, &freeb, NULL, NULL))
-            clip_log("Lazy staging '%ls' has %llu MB free.",
+        if (GetDiskFreeSpaceExW(g_lazy_dir, &freeb, NULL, NULL) &&
+            freeb.QuadPart < s->declared_size)
+            clip_log("Lazy staging '%ls' has only %llu MB free, less than the "
+                     "%llu MB file being pasted.",
                      g_lazy_dir,
-                     (unsigned long long)(freeb.QuadPart / (1024 * 1024)));
+                     (unsigned long long)(freeb.QuadPart / (1024 * 1024)),
+                     (unsigned long long)(s->declared_size / (1024 * 1024)));
     }
     swprintf_s(tmp, MAX_PATH, L"%s\\_fc_%ld_%d.tmp",
                g_lazy_dir, (long)gen, s->index);
@@ -763,8 +767,6 @@ static BOOL fcs_start_request(FileContentsStream *s)
         LeaveCriticalSection(&g_xfer_cs);
     }
 
-    clip_log("Lazy stream %d (%ls): got wire slot gen %ld.",
-             s->index, s->rel_name, (long)gen);
     return TRUE;
 }
 
@@ -778,10 +780,6 @@ static HRESULT fcs_read_impl(IStream *this, void *pv, ULONG cb, ULONG *pcbRead)
 
     if (pcbRead) *pcbRead = 0;
     if (cb == 0) return S_OK;
-
-    if (!s->started)
-        clip_log("Stream %d first Read (cb=%lu, size=%llu).",
-                 s->index, cb, (unsigned long long)s->declared_size);
 
     if (s->declared_size == 0) {
         s->finished = 1;
@@ -852,13 +850,6 @@ static HRESULT fcs_read_impl(IStream *this, void *pv, ULONG cb, ULONG *pcbRead)
                 s->finished = 1;
                 return E_FAIL;
             }
-            if (s->pos == 0 && got > 0)
-                clip_log("Stream %d first data: pos %llu -> %llu of %llu "
-                         "(cb=%lu got=%lu avail=%llu).",
-                         s->index, (unsigned long long)s->pos,
-                         (unsigned long long)(s->pos + got),
-                         (unsigned long long)s->declared_size, cb, got,
-                         (unsigned long long)avail);
             s->pos += got;
             if (pcbRead) *pcbRead = got;
             return got ? S_OK : E_FAIL;
@@ -900,7 +891,10 @@ static HRESULT fcs_read_impl(IStream *this, void *pv, ULONG cb, ULONG *pcbRead)
             return E_FAIL;
         }
 
-        if (GetTickCount64() - last_log >= 5000) {
+        /* A heartbeat, not a progress bar: the shell already shows the bytes.
+           One line every 30 s keeps a wedged paste visible without flooding
+           the log during a multi-minute transfer. */
+        if (GetTickCount64() - last_log >= 30000) {
             last_log = GetTickCount64();
             clip_log("Stream %d waiting: pos=%llu avail=%llu declared=%llu "
                      "done=%d error=%d.",
@@ -950,13 +944,6 @@ static HRESULT STDMETHODCALLTYPE FCS_Seek(IStream *this, LARGE_INTEGER dlibMove,
     np = base + dlibMove.QuadPart;
     if (np < 0) return STG_E_INVALIDFUNCTION;
 
-    if (s->seek_logs < 16) {
-        s->seek_logs++;
-        clip_log("Stream %d Seek(origin=%lu, move=%lld): %llu -> %llu of %llu.",
-                 s->index, dwOrigin, (long long)dlibMove.QuadPart,
-                 (unsigned long long)s->pos, (unsigned long long)np,
-                 (unsigned long long)s->declared_size);
-    }
     s->pos = (UINT64)np;
     if (plibNewPosition) plibNewPosition->QuadPart = (ULONGLONG)np;
     return S_OK;
@@ -1042,8 +1029,6 @@ static HRESULT STDMETHODCALLTYPE FCS_Stat(IStream *this, STATSTG *pstatstg, DWOR
     ZeroMemory(pstatstg, sizeof(*pstatstg));
     pstatstg->type = STGTY_STREAM;
     pstatstg->cbSize.QuadPart = s->declared_size;
-    clip_log("Stream %d Stat -> %llu bytes.",
-             s->index, (unsigned long long)s->declared_size);
     return S_OK;
 }
 

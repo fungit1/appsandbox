@@ -165,7 +165,6 @@ typedef struct {
     int          started;
     int          finished;
     int          abandoned;        /* paste released this stream (under xfer_cs) */
-    int          seek_logs;        /* bound Seek diagnostics */
     struct VmClipboardData *clip;
 } ClipFCS;
 
@@ -1456,11 +1455,16 @@ static BOOL clip_lazy_start_request(VmClipboard clip, ClipFCS *s)
 
     CreateDirectoryW(clip->lazy_dir, NULL);
     {
+        /* Only worth a line when the paste may actually run out of space;
+           otherwise this repeats once per file of a multi-file paste. */
         ULARGE_INTEGER freeb;
-        if (GetDiskFreeSpaceExW(clip->lazy_dir, &freeb, NULL, NULL))
-            clip_log(clip, L"CLIP-R: Lazy staging '%ls' has %llu MB free.",
+        if (GetDiskFreeSpaceExW(clip->lazy_dir, &freeb, NULL, NULL) &&
+            freeb.QuadPart < s->declared_size)
+            clip_log(clip, L"CLIP-R: Lazy staging '%ls' has only %llu MB free, "
+                           L"less than the %llu MB file being pasted.",
                      clip->lazy_dir,
-                     (unsigned long long)(freeb.QuadPart / (1024 * 1024)));
+                     (unsigned long long)(freeb.QuadPart / (1024 * 1024)),
+                     (unsigned long long)(s->declared_size / (1024 * 1024)));
     }
     _snwprintf_s(tmp, MAX_PATH, _TRUNCATE, L"%s\\_gc_%d_%ld.tmp",
                  clip->lazy_dir, s->index, (long)gen);
@@ -1555,10 +1559,6 @@ static HRESULT STDMETHODCALLTYPE clip_fcs_read_impl(IStream *this, void *pv, ULO
     if (pcbRead) *pcbRead = 0;
     if (cb == 0) return S_OK;
 
-    if (!s->started)
-        clip_log(clip, L"CLIP-R: Stream #%d (idx %d) first Read (cb=%lu, size=%llu).",
-                 s->id, s->index, cb, (unsigned long long)s->declared_size);
-
     if (s->declared_size == 0) {
         s->finished = 1;
         return S_FALSE;
@@ -1607,13 +1607,6 @@ static HRESULT STDMETHODCALLTYPE clip_fcs_read_impl(IStream *this, void *pv, ULO
             off.QuadPart = (LONGLONG)s->pos;
             if (!SetFilePointerEx(s->hFile, off, NULL, FILE_BEGIN)) { s->finished = 1; return E_FAIL; }
             if (!ReadFile(s->hFile, pv, (DWORD)n, &got, NULL)) { s->finished = 1; return E_FAIL; }
-            if (s->pos == 0 && got > 0)
-                clip_log(clip, L"CLIP-R: Stream #%d (idx %d) first data: pos %llu "
-                               L"-> %llu of %llu (cb=%lu got=%lu avail=%llu).",
-                         s->id, s->index, (unsigned long long)(s->pos),
-                         (unsigned long long)(s->pos + got),
-                         (unsigned long long)s->declared_size, cb, got,
-                         (unsigned long long)avail);
             s->pos += got;
             if (pcbRead) *pcbRead = got;
             return got ? S_OK : E_FAIL;
@@ -1672,7 +1665,10 @@ static HRESULT STDMETHODCALLTYPE clip_fcs_read_impl(IStream *this, void *pv, ULO
             }
         }
 
-        if (now - last_log >= 5000) {
+        /* A heartbeat, not a progress bar: the shell already shows the bytes.
+           One line every 30 s keeps a wedged paste visible without flooding
+           the UI log during a multi-minute transfer. */
+        if (now - last_log >= 30000) {
             last_log = now;
             clip_log(clip, L"CLIP-R: Stream #%d (idx %d, gen %ld) waiting: "
                            L"pos=%llu avail=%llu declared=%llu done=%d error=%d.",
@@ -1726,14 +1722,6 @@ static HRESULT STDMETHODCALLTYPE ClipFCS_Seek(IStream *this, LARGE_INTEGER dlibM
     }
     np = base + dlibMove.QuadPart;
     if (np < 0) return STG_E_INVALIDFUNCTION;
-    if (s->seek_logs < 16) {
-        s->seek_logs++;
-        clip_log(s->clip, L"CLIP-R: Stream %d Seek(origin=%lu, move=%lld): "
-                           L"%llu -> %llu of %llu.",
-                 s->index, dwOrigin, (long long)dlibMove.QuadPart,
-                 (unsigned long long)s->pos, (unsigned long long)np,
-                 (unsigned long long)s->declared_size);
-    }
     s->pos = (UINT64)np;
     if (plibNewPosition) plibNewPosition->QuadPart = (ULONGLONG)np;
     return S_OK;
@@ -1761,10 +1749,6 @@ static HRESULT STDMETHODCALLTYPE ClipFCS_CopyTo(IStream *this, IStream *pstm, UL
         else left = ~(UINT64)0;
     }
 
-    clip_log(s->clip, L"CLIP-R: Stream %d CopyTo(%llu bytes) from pos %llu.",
-             s->index, (unsigned long long)cb.QuadPart,
-             (unsigned long long)s->pos);
-
     while (left > 0) {
         ULONG want = left > sizeof(buf) ? (ULONG)sizeof(buf) : (ULONG)left;
         ULONG got = 0, written = 0;
@@ -1785,8 +1769,9 @@ static HRESULT STDMETHODCALLTYPE ClipFCS_CopyTo(IStream *this, IStream *pstm, UL
 
     if (pcbRead) pcbRead->QuadPart = rd;
     if (pcbWritten) pcbWritten->QuadPart = wr;
-    clip_log(s->clip, L"CLIP-R: Stream %d CopyTo done: read %llu, wrote %llu.",
-             s->index, (unsigned long long)rd, (unsigned long long)wr);
+    if (wr != rd)
+        clip_log(s->clip, L"CLIP-R: Stream %d CopyTo wrote %llu of %llu bytes.",
+                 s->index, (unsigned long long)wr, (unsigned long long)rd);
     return S_OK;
 }
 
@@ -1824,8 +1809,6 @@ static HRESULT STDMETHODCALLTYPE ClipFCS_Stat(IStream *this, STATSTG *pstatstg, 
     ZeroMemory(pstatstg, sizeof(*pstatstg));
     pstatstg->type = STGTY_STREAM;
     pstatstg->cbSize.QuadPart = s->declared_size;
-    clip_log(s->clip, L"CLIP-R: Stream %d Stat -> %llu bytes.",
-             s->index, (unsigned long long)s->declared_size);
     return S_OK;
 }
 
