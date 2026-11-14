@@ -811,6 +811,24 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
             clip_serve_file_request(idx);
             break;
         }
+
+        case CLIP_MSG_PULL_LIST: {
+            /* The host's advertised list is stale (a paste was refused).
+               Re-send the current clipboard list; if a file body is being
+               served, clip_send_format_list defers and posts again when the
+               serve finishes.  Old hosts never send this. */
+            UINT32 remaining = hdr.data_size;
+            BYTE skip[256];
+            while (remaining > 0) {
+                int chunk = remaining > (UINT32)sizeof(skip)
+                                ? (int)sizeof(skip) : (int)remaining;
+                if (!recv_exact(s, skip, chunk)) goto done;
+                remaining -= (UINT32)chunk;
+            }
+            reader_log("Host asked for the current clipboard list.");
+            if (g_msg_hwnd) PostMessageW(g_msg_hwnd, WM_CLIP_PUSH_LIST, 0, 0);
+            break;
+        }
         default:
             reader_log("Unknown msg_type %u.", hdr.msg_type);
             if (hdr.data_size > 0) {
