@@ -2,8 +2,8 @@
  * vm_clipboard.c -- Per-VM clipboard synchronization over Hyper-V sockets.
  *
  * Extracted from vm_display_idd.c. Manages two channels:
- *   :0005  Host->guest (writer) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â sends FORMAT_LIST, serves DATA_REQ
- *   :0006  Guest->host (reader) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â receives FORMAT_LIST, fetches data
+ *   :0005  Host->guest (writer) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â sends FORMAT_LIST, serves DATA_REQ
+ *   :0006  Guest->host (reader) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â receives FORMAT_LIST, fetches data
  *
  * Focus-gated: sync is disabled by default. The display window toggles
  * it on focus/blur. When disabled, no clipboard traffic flows in either
@@ -40,7 +40,7 @@ typedef struct {
 } SOCKADDR_HV;
 #pragma pack(pop)
 
-/* Both superseded by hcs_service_guid(os_type, 5|6, ...) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â kept for grep.
+/* Both superseded by hcs_service_guid(os_type, 5|6, ...) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â kept for grep.
    Windows VMs reach byte-identical GUIDs via the helper. */
 static const GUID CLIPBOARD_SERVICE_GUID =
     { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
@@ -186,6 +186,8 @@ struct VmClipboardData {
     HWND             hwnd;
     volatile BOOL    stop;
     volatile BOOL    sync_enabled;
+    volatile BOOL    share_host_to_guest;  /* default TRUE */
+    volatile BOOL    share_guest_to_host;  /* default TRUE */
 
     VmClipboardLogFn log_fn;
     void            *log_ud;
@@ -1043,6 +1045,8 @@ static void clip_send_format_list(VmClipboard clip)
             }
     }
 }
+}
+}
 
 /* ---- Push worker thread ---- */
 
@@ -1089,8 +1093,8 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
 
     clip_log(clip, L"CLIP: Data request from guest for format %u.", fmt);
 
-    /* When sync is disabled, return empty ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â don't leak host clipboard. */
-    if (!clip->sync_enabled) {
+    /* When sync is disabled, return empty ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â don't leak host clipboard. */
+    if (!clip->sync_enabled || !clip->share_host_to_guest) {
         hdr.magic = CLIP_MAGIC;
         hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
         hdr.format = fmt;
@@ -2433,7 +2437,8 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
                     InterlockedExchange(&clip->pushed_seq_valid, 0);
                     if (clip->sync_enabled) {
                         clip_queue_sync_enable(clip, TRUE);
-                        clip_queue_push(clip);
+                        if (clip->share_host_to_guest)
+                            clip_queue_push(clip);
                     } else {
                         clip_queue_sync_enable(clip, FALSE);
                     }
@@ -2818,8 +2823,9 @@ static BOOL clip_reader_serve_file_request(VmClipboard clip, SOCKET s)
                      fi.is_directory ? L", directory" : L"");
             /* The guest has copied something else since this list was
                advertised.  Refresh it after the reconnect so the next paste
-               does not fail the same way. */
-            InterlockedExchange(&clip->reader_pull_needed, 1);
+               does not fail the same way (only when guest->host sharing is on). */
+            if (clip->share_guest_to_host)
+                InterlockedExchange(&clip->reader_pull_needed, 1);
             ok = FALSE;
         }
     }
@@ -2953,7 +2959,8 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
            takes precedence over a pending echo token.  The token expires so an
            old guest (which ignores the request) cannot keep the focus gate
            bypassed for the rest of the connection. */
-        pulled = (InterlockedCompareExchange(&clip->reader_pull_sent, 0, 0) != 0 &&
+        pulled = (clip->share_guest_to_host &&
+                  InterlockedCompareExchange(&clip->reader_pull_sent, 0, 0) != 0 &&
                   GetTickCount64() < clip->reader_pull_deadline);
         if (pulled) {
             InterlockedExchange(&clip->reader_pull_sent, 0);
@@ -2968,7 +2975,14 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
             return TRUE;
         }
 
-        /* Focus gate: discard if sync is off */
+        /* Direction gate: discard if guest->host sharing is off. */
+        if (!clip->share_guest_to_host) {
+            clip_log(clip, L"CLIP-R: FORMAT_LIST discarded (direction disabled).");
+            HeapFree(GetProcessHeap(), 0, buf);
+            return TRUE;
+        }
+        /* Focus gate: discard if sync is off and this is not a host-requested
+           (pulled) refresh. */
         if (!pulled && !clip->sync_enabled) {
             clip_log(clip, L"CLIP-R: FORMAT_LIST discarded (sync disabled).");
             HeapFree(GetProcessHeap(), 0, buf);
@@ -3231,8 +3245,9 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
         s = clip->reader_socket;
 
         /* The previous connection was dropped by a refused (stale) request:
-           ask the guest for its current list before serving anything else. */
-        if (InterlockedExchange(&clip->reader_pull_needed, 0))
+           ask the guest for its current list before serving anything else
+           (only when guest->host sharing is on). */
+        if (clip->share_guest_to_host && InterlockedExchange(&clip->reader_pull_needed, 0))
             clip_reader_request_list(clip, s);
 
         while (!clip->stop) {
@@ -3349,6 +3364,8 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->log_ud = log_ud;
     clip->stop = FALSE;
     clip->sync_enabled = FALSE;
+    clip->share_host_to_guest = TRUE;
+    clip->share_guest_to_host = TRUE;
     clip->writer_socket = INVALID_SOCKET;
     clip->reader_socket = INVALID_SOCKET;
     clip->writer_suppress = 0;
@@ -3481,7 +3498,7 @@ ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled)
     if ((BOOL)clip->sync_enabled == enabled) return;
 
     clip->sync_enabled = enabled;
-    clip_log(clip, L"CLIP: Window %s ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â clipboard sync %s.",
+    clip_log(clip, L"CLIP: Window %s ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â clipboard sync %s.",
              enabled ? L"focused" : L"unfocused",
              enabled ? L"ON" : L"OFF");
 
@@ -3491,9 +3508,36 @@ ASB_API void vm_clipboard_set_sync_enabled(VmClipboard clip, BOOL enabled)
        that order. */
     clip_queue_sync_enable(clip, enabled);
 
-    if (enabled) {
+    if (enabled && clip->share_host_to_guest) {
         clip_queue_push(clip);
     }
+}
+
+ASB_API void vm_clipboard_set_share_directions(VmClipboard clip,
+                                               BOOL share_host_to_guest,
+                                               BOOL share_guest_to_host)
+{
+    if (!clip) return;
+    clip->share_host_to_guest = share_host_to_guest ? TRUE : FALSE;
+    clip->share_guest_to_host = share_guest_to_host ? TRUE : FALSE;
+
+    clip_log(clip, L"CLIP: Share host->guest %s, guest->host %s.",
+             clip->share_host_to_guest ? L"ON" : L"OFF",
+             clip->share_guest_to_host ? L"ON" : L"OFF");
+
+    /* If host->guest was just switched back on while the window is focused,
+       push the current host clipboard immediately so the toggle is instant. */
+    if (clip->share_host_to_guest && clip->sync_enabled)
+        clip_queue_push(clip);
+}
+
+ASB_API void vm_clipboard_get_share_directions(VmClipboard clip,
+                                               BOOL *share_host_to_guest,
+                                               BOOL *share_guest_to_host)
+{
+    if (!clip) return;
+    if (share_host_to_guest) *share_host_to_guest = clip->share_host_to_guest;
+    if (share_guest_to_host) *share_guest_to_host = clip->share_guest_to_host;
 }
 
 ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
@@ -3506,8 +3550,8 @@ ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
         return;
     }
 
-    /* Focus gate */
-    if (!clip->sync_enabled) return;
+    /* Focus/direction gate */
+    if (!clip->sync_enabled || !clip->share_host_to_guest) return;
 
     clip_queue_push(clip);
 }
@@ -3518,6 +3562,13 @@ ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
     BOOL lazy;
 
     if (!clip) return;
+
+    if (!clip->share_guest_to_host) {
+        EnterCriticalSection(&clip->reader_cs);
+        clip_reader_free_pending(clip);
+        LeaveCriticalSection(&clip->reader_cs);
+        return;
+    }
 
     EnterCriticalSection(&clip->reader_cs);
     if (clip->reader_fmt_count == 0) {
